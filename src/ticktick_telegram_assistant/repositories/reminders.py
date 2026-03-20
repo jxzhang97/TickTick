@@ -12,3 +12,7 @@ class ReminderRepository:
             self._session.add(reminder_event)
         return reminder_event
 
+    def add_many(self, reminder_events: list[ReminderEvent]) -> list[ReminderEvent]:
+        if self._session is not None:
+            self._session.add_all(reminder_events)
+        return reminder_events

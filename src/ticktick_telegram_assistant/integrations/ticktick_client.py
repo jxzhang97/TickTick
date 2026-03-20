@@ -17,6 +17,7 @@ class TickTickTask(BaseModel):
     id: str
     title: str
     description: str = ""
+    completed: bool = False
 
 
 class TickTickTaskCreate(BaseModel):
@@ -46,8 +47,8 @@ class TickTickClient:
             id=task_id,
             title=patch.title or "",
             description=patch.description or "",
+            completed=bool(patch.completed),
         )
 
     async def complete_task(self, task_id: str) -> TickTickTask:
-        return TickTickTask(id=task_id, title="", description="")
-
+        return TickTickTask(id=task_id, title="", description="", completed=True)

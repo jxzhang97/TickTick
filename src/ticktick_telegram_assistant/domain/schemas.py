@@ -51,3 +51,8 @@ class ReminderEventPayload(BaseModel):
 class BriefingSection(BaseModel):
     title: str
     items: list[str] = Field(default_factory=list)
+
+
+class EveningReviewReply(BaseModel):
+    completed_indices: list[int] = Field(default_factory=list)
+    rescheduled_indices: list[int] = Field(default_factory=list)
