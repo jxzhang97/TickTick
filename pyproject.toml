@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ticktick-telegram-assistant"
+version = "0.1.0"
+description = "Telegram-first TickTick assistant with contextual planning."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+  "fastapi",
+  "uvicorn[standard]",
+  "pydantic>=2.0",
+  "pydantic-settings",
+  "sqlalchemy>=2.0",
+  "psycopg[binary]",
+  "alembic",
+  "httpx",
+  "openai",
+  "apscheduler",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+  "pytest-asyncio",
+  "pytest-cov",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
