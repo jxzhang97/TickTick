@@ -1,9 +1,0 @@
-README.md
-pyproject.toml
-src/ticktick_telegram_assistant/__init__.py
-src/ticktick_telegram_assistant/app.py
-src/ticktick_telegram_assistant.egg-info/PKG-INFO
-src/ticktick_telegram_assistant.egg-info/SOURCES.txt
-src/ticktick_telegram_assistant.egg-info/dependency_links.txt
-src/ticktick_telegram_assistant.egg-info/requires.txt
-src/ticktick_telegram_assistant.egg-info/top_level.txt
