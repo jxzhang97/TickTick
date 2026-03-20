@@ -8,4 +8,6 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://assistant:assistant@localhost:5432/assistant"
     telegram_bot_token: str = ""
     openai_api_key: str = ""
-
+    ticktick_base_url: str = "https://developer.ticktick.com"
+    ticktick_client_id: str = ""
+    ticktick_client_secret: str = ""
