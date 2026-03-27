@@ -1,0 +1,72 @@
+# Mac Studio Deployment
+
+This runbook documents the zero-cost local deployment flow for the TickTick Telegram assistant on a long-lived Mac Studio.
+
+## Target directory
+
+Clone or sync the repository into:
+
+```bash
+/Users/jiaxinzhang/doc_unsyn/TickTick_Codex
+```
+
+## First-time setup
+
+```bash
+cd /Users/jiaxinzhang/doc_unsyn/TickTick_Codex
+python3 -m venv .venv
+.venv/bin/python -m pip install -e '.[dev]'
+cp .env.example .env
+docker compose up -d postgres
+.venv/bin/alembic upgrade head
+```
+
+Fill `.env` with your real secrets before starting the service.
+
+## Manual start
+
+```bash
+cd /Users/jiaxinzhang/doc_unsyn/TickTick_Codex
+./scripts/run_local_assistant.sh
+```
+
+## Install launchd service
+
+```bash
+mkdir -p ~/Library/LaunchAgents
+cp deploy/macos/com.jxzhang.ticktick-assistant.plist ~/Library/LaunchAgents/
+launchctl unload ~/Library/LaunchAgents/com.jxzhang.ticktick-assistant.plist 2>/dev/null || true
+launchctl load ~/Library/LaunchAgents/com.jxzhang.ticktick-assistant.plist
+launchctl start com.jxzhang.ticktick-assistant
+```
+
+## Check status
+
+```bash
+launchctl list | rg ticktick-assistant
+tail -f logs/launchd.stdout.log logs/launchd.stderr.log
+tail -f logs/api.stdout.log logs/api.stderr.log
+```
+
+## Stop or restart
+
+```bash
+launchctl stop com.jxzhang.ticktick-assistant
+launchctl start com.jxzhang.ticktick-assistant
+```
+
+## TickTick OAuth callback
+
+The local API exposes:
+
+```text
+http://127.0.0.1:8000/auth/ticktick/callback
+```
+
+When you need to complete TickTick OAuth, temporarily expose port `8000` with an HTTPS tunnel, update the TickTick developer console `OAuth redirect URL`, finish the authorization, then shut the tunnel down.
+
+## Operating assumptions
+
+- Keep the Mac Studio awake and online.
+- Telegram polling is the default receive mode.
+- Postgres runs locally via Docker Compose.

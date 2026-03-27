@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from ticktick_telegram_assistant.domain.schemas import PlannedConversation
 from ticktick_telegram_assistant.integrations.openai_planner import OpenAIPlanner
@@ -16,8 +16,10 @@ class TelegramChat(BaseModel):
 
 
 class TelegramMessage(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     message_id: int
-    from_: TelegramUser | None = None
+    from_: TelegramUser | None = Field(default=None, alias="from")
     chat: TelegramChat
     text: str | None = None
     location: dict | None = None
