@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 from openai import AsyncOpenAI
 
@@ -25,17 +26,21 @@ class LocalAssistantRunner:
         telegram_client: TelegramClient,
         poller: TelegramPoller,
         reminder_worker: ReminderWorker,
+        offset_state_path: str | Path | None = None,
     ) -> None:
         self._telegram_client = telegram_client
         self._poller = poller
         self._reminder_worker = reminder_worker
         self.last_update_offset: int | None = None
+        self._offset_state_path = Path(offset_state_path) if offset_state_path is not None else None
 
     async def bootstrap(self) -> None:
         await self._telegram_client.delete_webhook()
+        self.last_update_offset = self._load_offset_state()
 
     async def run_once(self) -> None:
         self.last_update_offset = await self._poller.poll_once(self.last_update_offset)
+        self._save_offset_state(self.last_update_offset)
         await self._reminder_worker.run_once()
 
     async def run_forever(self, *, iterations: int | None = None, sleep_seconds: float = 1.0) -> None:
@@ -46,6 +51,26 @@ class LocalAssistantRunner:
             run_count += 1
             if iterations is None or run_count < iterations:
                 await asyncio.sleep(sleep_seconds)
+
+    def _load_offset_state(self) -> int | None:
+        if self._offset_state_path is None or not self._offset_state_path.exists():
+            return None
+        raw_value = self._offset_state_path.read_text().strip()
+        if not raw_value:
+            return None
+        try:
+            return int(raw_value)
+        except ValueError:
+            return None
+
+    def _save_offset_state(self, offset: int | None) -> None:
+        if self._offset_state_path is None:
+            return
+        self._offset_state_path.parent.mkdir(parents=True, exist_ok=True)
+        if offset is None:
+            self._offset_state_path.write_text("")
+            return
+        self._offset_state_path.write_text(f"{offset}\n")
 
 
 def build_local_runner(settings: Settings | None = None) -> LocalAssistantRunner:
@@ -88,6 +113,7 @@ def build_local_runner(settings: Settings | None = None) -> LocalAssistantRunner
             ticktick_client=ticktick_client,
             telegram_client=telegram_client,
         ),
+        offset_state_path=app_settings.telegram_offset_state_path,
     )
 
 

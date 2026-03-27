@@ -3,7 +3,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from ticktick_telegram_assistant.integrations.ticktick_client import TickTickClient
+from ticktick_telegram_assistant.integrations.ticktick_client import TickTickClient, TickTickTaskPatch
 
 
 @pytest.mark.asyncio
@@ -46,3 +46,30 @@ async def test_list_projects_and_project_data_use_official_open_api_paths() -> N
         "/open/v1/project",
         "/open/v1/project/p1/data",
     ]
+
+
+@pytest.mark.asyncio
+async def test_update_task_accepts_empty_response_body() -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, content=b"")
+
+    client = TickTickClient(
+        base_url="https://api.ticktick.com",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+    result = await client.update_task(
+        access_token="token-123",
+        task_id="t1",
+        patch=TickTickTaskPatch(
+            id="t1",
+            projectId="p1",
+            desc="记得带附件",
+        ),
+    )
+
+    assert result is None
+    assert [request.url.path for request in requests] == ["/open/v1/task/t1"]

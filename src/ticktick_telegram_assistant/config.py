@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     public_base_url: str = ""
     telegram_bot_token: str = ""
     telegram_poll_timeout_seconds: int = 30
+    telegram_offset_state_path: str = "state/telegram_offset.txt"
     openai_api_key: str = ""
     ticktick_base_url: str = "https://api.ticktick.com"
     ticktick_authorize_url: str = "https://ticktick.com/oauth/authorize"

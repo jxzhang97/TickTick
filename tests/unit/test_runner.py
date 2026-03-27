@@ -67,3 +67,28 @@ async def test_local_runner_run_forever_executes_requested_iterations() -> None:
     assert telegram_client.deleted is True
     assert poller.offsets == [None, 55]
     assert reminder_worker.runs == 2
+
+
+@pytest.mark.asyncio
+async def test_local_runner_bootstrap_loads_saved_offset_and_run_once_persists_it(tmp_path) -> None:
+    from ticktick_telegram_assistant.runner import LocalAssistantRunner
+
+    telegram_client = FakeTelegramClient()
+    poller = FakePoller()
+    reminder_worker = FakeReminderWorker()
+    state_path = tmp_path / "telegram_offset.txt"
+    state_path.write_text("777\n")
+    runner = LocalAssistantRunner(
+        telegram_client=telegram_client,
+        poller=poller,
+        reminder_worker=reminder_worker,
+        offset_state_path=state_path,
+    )
+
+    await runner.bootstrap()
+    await runner.run_once()
+
+    assert telegram_client.deleted is True
+    assert poller.offsets == [777]
+    assert state_path.read_text() == "55\n"
+    assert runner.last_update_offset == 55

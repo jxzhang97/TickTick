@@ -144,13 +144,15 @@ class TickTickClient:
         access_token: str,
         task_id: str,
         patch: TickTickTaskPatch,
-    ) -> TickTickTask:
+    ) -> TickTickTask | None:
         payload = await self._request(
             "POST",
             f"/open/v1/task/{task_id}",
             access_token=access_token,
             json=patch.model_dump(exclude_none=True),
         )
+        if payload is None:
+            return None
         return TickTickTask.model_validate(payload)
 
     async def complete_task(self, *, access_token: str, project_id: str, task_id: str) -> None:

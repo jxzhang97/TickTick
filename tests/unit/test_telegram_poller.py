@@ -22,9 +22,12 @@ class FakeTelegramClient:
 class FakeConversationService:
     def __init__(self) -> None:
         self.handled: list[TelegramUpdate] = []
+        self.fail_update_ids: set[int] = set()
 
     async def handle_update(self, update: TelegramUpdate) -> list[TelegramReply]:
         self.handled.append(update)
+        if update.update_id in self.fail_update_ids:
+            raise RuntimeError("boom")
         return [TelegramReply(chat_id=update.message.chat.id, text="收到，我记下了。")]
 
 
@@ -53,3 +56,38 @@ async def test_poll_once_processes_updates_and_returns_next_offset() -> None:
     assert [update.update_id for update in service.handled] == [101]
     assert client.sent_messages == [{"chat_id": 99, "text": "收到，我记下了。"}]
     assert next_offset == 102
+
+
+@pytest.mark.asyncio
+async def test_poll_once_advances_offset_even_when_one_update_handler_crashes() -> None:
+    from ticktick_telegram_assistant.integrations.telegram_poller import TelegramPoller
+
+    client = FakeTelegramClient(
+        updates=[
+            {
+                "update_id": 101,
+                "message": {
+                    "message_id": 1,
+                    "chat": {"id": 99, "type": "private"},
+                    "text": "第一条",
+                },
+            },
+            {
+                "update_id": 102,
+                "message": {
+                    "message_id": 2,
+                    "chat": {"id": 99, "type": "private"},
+                    "text": "第二条",
+                },
+            },
+        ]
+    )
+    service = FakeConversationService()
+    service.fail_update_ids.add(101)
+    poller = TelegramPoller(telegram_client=client, conversation_service=service, timeout_seconds=30)
+
+    next_offset = await poller.poll_once(offset=100)
+
+    assert [update.update_id for update in service.handled] == [101, 102]
+    assert client.sent_messages == [{"chat_id": 99, "text": "收到，我记下了。"}]
+    assert next_offset == 103

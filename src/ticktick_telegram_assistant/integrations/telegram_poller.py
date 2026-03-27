@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from ticktick_telegram_assistant.services.conversation_service import ConversationService, TelegramUpdate
+
+
+logger = logging.getLogger(__name__)
 
 
 class TelegramPoller:
@@ -28,9 +32,14 @@ class TelegramPoller:
 
         next_offset = offset
         for raw_update in raw_updates:
-            update = TelegramUpdate.model_validate(raw_update)
-            replies = await self._conversation_service.handle_update(update)
-            for reply in replies:
-                await self._telegram_client.send_message(chat_id=reply.chat_id, text=reply.text)
-            next_offset = update.update_id + 1
+            update_id = raw_update.get("update_id", offset or 0)
+            try:
+                update = TelegramUpdate.model_validate(raw_update)
+                replies = await self._conversation_service.handle_update(update)
+                for reply in replies:
+                    await self._telegram_client.send_message(chat_id=reply.chat_id, text=reply.text)
+                next_offset = update.update_id + 1
+            except Exception:
+                logger.exception("failed to process telegram update", extra={"update_id": update_id})
+                next_offset = max(next_offset or 0, int(update_id) + 1)
         return next_offset
