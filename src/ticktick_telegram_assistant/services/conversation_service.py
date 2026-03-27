@@ -52,6 +52,9 @@ class ConversationService:
     async def handle_update(self, update: TelegramUpdate) -> list[TelegramReply]:
         if update.message is None or update.message.text is None:
             return []
+        batch_replies = await self._maybe_handle_multiline_batch(update)
+        if batch_replies is not None:
+            return batch_replies
         if self._is_evening_review_reply(update.message.text):
             return await self._handle_evening_review_reply(
                 chat_id=update.message.chat.id,
@@ -210,6 +213,30 @@ class ConversationService:
         self._store_active_task_context(telegram_user_id=telegram_user_id, action=action)
         return TelegramReply(chat_id=update.message.chat.id, text=reply_text)
 
+    async def _maybe_handle_multiline_batch(self, update: TelegramUpdate) -> list[TelegramReply] | None:
+        if update.message is None or update.message.text is None:
+            return None
+        lines = self._context_builder.split_lines(update.message.text)
+        if len(lines) <= 1:
+            return None
+
+        reply_texts: list[str] = []
+        for line in lines:
+            line_update = update.model_copy(
+                deep=True,
+                update={
+                    "message": update.message.model_copy(
+                        deep=True,
+                        update={"text": line},
+                    )
+                },
+            )
+            line_replies = await self.handle_update(line_update)
+            reply_texts.extend(reply.text for reply in line_replies if reply.text)
+
+        combined_text = "\n".join(reply_texts)
+        return [TelegramReply(chat_id=update.message.chat.id, text=combined_text)]
+
     def _resolve_follow_up_text(self, *, telegram_user_id: str | None, text: str) -> str:
         if telegram_user_id is None:
             return text
@@ -224,11 +251,11 @@ class ConversationService:
         if self._has_explicit_task_reference(stripped):
             return stripped
         if stripped.startswith(("改到", "改成", "挪到", "推到", "提前", "延后", "放到")):
-            return f"把 {title} {stripped}"
+            return f"任务“{title}”{stripped}"
         if stripped.startswith(("再补一句", "补一句", "补充", "加一句")):
-            return f"给 {title} {stripped}"
+            return f"任务“{title}”{stripped}"
         if stripped.startswith(("做完了", "完成了", "勾掉", "勾选完成")):
-            return f"{title}{stripped}"
+            return f"任务“{title}”{stripped}"
         return stripped
 
     def _store_active_task_context(self, *, telegram_user_id: str, action: PlannedAction) -> None:
@@ -244,8 +271,10 @@ class ConversationService:
         self._active_task_contexts[telegram_user_id] = {"title": str(title).strip()}
 
     def _has_explicit_task_reference(self, text: str) -> bool:
-        if any(marker in text for marker in ("那个", "这条", "前", "第", "最后")):
-            return True
+        if text.startswith(("那个", "这条", "前", "第", "最后")):
+            return False
+        if text.startswith(("改到", "改成", "挪到", "推到", "提前", "延后", "放到", "再补一句", "补一句", "补充", "加一句", "做完了", "完成了", "勾掉", "勾选完成")):
+            return False
         return " " in text or len(text) > 12
 
 

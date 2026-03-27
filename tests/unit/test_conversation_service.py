@@ -361,4 +361,87 @@ async def test_handle_update_reuses_last_task_context_for_follow_up_edit() -> No
     await service.handle_update(create_update)
     await service.handle_update(follow_up_update)
 
-    assert planner.contexts[1].user_text == "把 给导师发邮件 改到后天下午3点"
+    assert planner.contexts[1].user_text == "任务“给导师发邮件”改到后天下午3点"
+
+
+@pytest.mark.asyncio
+async def test_handle_update_processes_multiline_batch_sequentially() -> None:
+    planner = FakePlanner(
+        [
+            PlannedConversation(
+                actions=[
+                    {
+                        "action_type": "create_task",
+                        "payload": {
+                            "title": "给导师发邮件",
+                            "semantic_type": "explicit_time",
+                            "due_at": "2026-03-28T15:00:00-07:00",
+                        },
+                    }
+                ]
+            ),
+            PlannedConversation(
+                actions=[
+                    {
+                        "action_type": "update_task",
+                        "payload": {
+                            "match_title": "给导师发邮件",
+                            "due_at": "2026-03-29T15:00:00-07:00",
+                        },
+                    }
+                ]
+            ),
+            PlannedConversation(
+                actions=[
+                    {
+                        "action_type": "update_task",
+                        "payload": {
+                            "match_title": "给导师发邮件",
+                            "description": "记得带附件",
+                            "description_mode": "append",
+                        },
+                    }
+                ]
+            ),
+            PlannedConversation(
+                actions=[
+                    {
+                        "action_type": "update_task",
+                        "payload": {
+                            "match_title": "给导师发邮件",
+                            "list_name": "fun",
+                        },
+                    }
+                ]
+            ),
+        ]
+    )
+    oauth_service = FakeTickTickOAuthService(connected=True, auth_url=None)
+    task_command_service = FakeTaskCommandService()
+    task_command_service.reply_text = "ok"
+    service = ConversationService(
+        planner=planner,
+        ticktick_oauth_service=oauth_service,
+        task_command_service=task_command_service,
+    )
+    update = TelegramUpdate.model_validate(
+        {
+            "update_id": 10,
+            "message": {
+                "message_id": 16,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "明天下午3点提醒我给导师发邮件\n改到后天下午3点\n再补一句说明：记得带附件\n放到 fun 那个 list",
+            },
+        }
+    )
+
+    replies = await service.handle_update(update)
+
+    assert [reply.text for reply in replies] == ["ok\nok\nok\nok"]
+    assert [context.user_text for context in planner.contexts] == [
+        "明天下午3点提醒我给导师发邮件",
+        "任务“给导师发邮件”改到后天下午3点",
+        "任务“给导师发邮件”再补一句说明：记得带附件",
+        "任务“给导师发邮件”放到 fun 那个 list",
+    ]
