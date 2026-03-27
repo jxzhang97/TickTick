@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 
 import httpx
 from pydantic import BaseModel, Field
@@ -20,21 +20,21 @@ class TickTickCapabilities(BaseModel):
 class TickTickProject(BaseModel):
     id: str
     name: str
-    color: str | None = None
-    viewMode: str | None = None
-    permission: str | None = None
-    kind: str | None = None
+    color: Optional[str] = None
+    viewMode: Optional[str] = None
+    permission: Optional[str] = None
+    kind: Optional[str] = None
 
 
 class TickTickChecklistItem(BaseModel):
-    id: str | None = None
+    id: Optional[str] = None
     title: str
-    status: int | None = None
-    completedTime: str | None = None
-    isAllDay: bool | None = None
-    sortOrder: int | None = None
-    startDate: str | None = None
-    timeZone: str | None = None
+    status: Optional[int] = None
+    completedTime: Optional[str] = None
+    isAllDay: Optional[bool] = None
+    sortOrder: Optional[int] = None
+    startDate: Optional[str] = None
+    timeZone: Optional[str] = None
 
 
 class TickTickTask(BaseModel):
@@ -44,19 +44,19 @@ class TickTickTask(BaseModel):
     content: str = ""
     desc: str = ""
     completed: bool = False
-    isAllDay: bool | None = None
-    startDate: str | None = None
-    dueDate: str | None = None
-    timeZone: str | None = None
-    repeatFlag: str | None = None
+    isAllDay: Optional[bool] = None
+    startDate: Optional[str] = None
+    dueDate: Optional[str] = None
+    timeZone: Optional[str] = None
+    repeatFlag: Optional[str] = None
     reminders: list[str] = Field(default_factory=list)
-    priority: int | None = None
-    status: int | None = None
-    completedTime: str | None = None
-    sortOrder: int | None = None
+    priority: Optional[int] = None
+    status: Optional[int] = None
+    completedTime: Optional[str] = None
+    sortOrder: Optional[int] = None
     tags: list[str] = Field(default_factory=list)
     items: list[TickTickChecklistItem] = Field(default_factory=list)
-    kind: str | None = None
+    kind: Optional[str] = None
 
 
 class TickTickProjectData(BaseModel):
@@ -70,40 +70,42 @@ class TickTickTaskCreate(BaseModel):
     projectId: str
     content: str = ""
     desc: str = ""
-    isAllDay: bool | None = None
-    startDate: str | None = None
-    dueDate: str | None = None
-    timeZone: str | None = None
+    isAllDay: Optional[bool] = None
+    startDate: Optional[str] = None
+    dueDate: Optional[str] = None
+    timeZone: Optional[str] = None
     reminders: list[str] = Field(default_factory=list)
-    repeatFlag: str | None = None
-    priority: int | None = None
-    sortOrder: int | None = None
+    repeatFlag: Optional[str] = None
+    priority: Optional[int] = None
+    sortOrder: Optional[int] = None
     items: list[TickTickChecklistItem] = Field(default_factory=list)
+    tags: Optional[list[str]] = None
 
 
 class TickTickTaskPatch(BaseModel):
     id: str
     projectId: str
-    title: str | None = None
-    content: str | None = None
-    desc: str | None = None
-    isAllDay: bool | None = None
-    startDate: str | None = None
-    dueDate: str | None = None
-    timeZone: str | None = None
-    reminders: list[str] | None = None
-    repeatFlag: str | None = None
-    priority: int | None = None
-    sortOrder: int | None = None
-    items: list[TickTickChecklistItem] | None = None
+    title: Optional[str] = None
+    content: Optional[str] = None
+    desc: Optional[str] = None
+    isAllDay: Optional[bool] = None
+    startDate: Optional[str] = None
+    dueDate: Optional[str] = None
+    timeZone: Optional[str] = None
+    reminders: Optional[list[str]] = None
+    repeatFlag: Optional[str] = None
+    priority: Optional[int] = None
+    sortOrder: Optional[int] = None
+    items: Optional[list[TickTickChecklistItem]] = None
+    tags: Optional[list[str]] = None
 
 
 class TickTickClient:
     def __init__(
         self,
         base_url: str,
-        capabilities: TickTickCapabilities | None = None,
-        http_client: httpx.AsyncClient | None = None,
+        capabilities: Optional[TickTickCapabilities] = None,
+        http_client: Optional[httpx.AsyncClient] = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.capabilities = capabilities or TickTickCapabilities()
@@ -121,7 +123,7 @@ class TickTickClient:
         )
         return TickTickProjectData.model_validate(payload)
 
-    async def list_tasks(self, *, access_token: str, since: datetime | None = None) -> list[TickTickTask]:
+    async def list_tasks(self, *, access_token: str, since: Optional[datetime] = None) -> list[TickTickTask]:
         projects = await self.list_projects(access_token=access_token)
         tasks: list[TickTickTask] = []
         for project in projects:
@@ -144,7 +146,7 @@ class TickTickClient:
         access_token: str,
         task_id: str,
         patch: TickTickTaskPatch,
-    ) -> TickTickTask | None:
+    ) -> Optional[TickTickTask]:
         payload = await self._request(
             "POST",
             f"/open/v1/task/{task_id}",
@@ -168,7 +170,7 @@ class TickTickClient:
         path: str,
         *,
         access_token: str,
-        json: dict[str, Any] | None = None,
+        json: Optional[dict[str, Any]] = None,
     ) -> Any:
         headers = {"Authorization": f"Bearer {access_token}"}
         url = f"{self.base_url}{path}"

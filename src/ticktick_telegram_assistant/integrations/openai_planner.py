@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from textwrap import dedent
+from typing import Optional
 
 from openai import AsyncOpenAI
 from pydantic import ValidationError
@@ -10,7 +11,7 @@ from ticktick_telegram_assistant.domain.schemas import ConversationContext, Plan
 
 
 class OpenAIPlanner:
-    def __init__(self, client: AsyncOpenAI | None = None, model: str = "gpt-5-mini") -> None:
+    def __init__(self, client: Optional[AsyncOpenAI] = None, model: str = "gpt-5-mini") -> None:
         self._client = client
         self._model = model
 
@@ -51,7 +52,11 @@ class OpenAIPlanner:
                     "window_start": "粗略时间窗口开始 ISO 8601",
                     "window_end": "粗略时间窗口结束 ISO 8601",
                     "raw_nl_time": "原始自然语言时间片段",
-                    "list_name": "用户明确说了 list 才填"
+                    "list_name": "用户明确说了 list 才填",
+                    "repeat_rule": "重复规则，原样放入 TickTick repeatFlag",
+                    "priority": 1,
+                    "tags": ["标签1", "标签2"],
+                    "checklist": ["子任务1", "子任务2"]
                   }}
                 }}
               ],
@@ -65,6 +70,7 @@ class OpenAIPlanner:
             3. 用户明确说要改已有任务的时间、说明、标题或 list，并且文本里带了可定位的标题时，用 update_task；原任务标题放进 match_title，新的标题才放进 title。
             4. 用户说的是今天安排、日程查询，不要输出 create_task、complete_task 或 update_task。
             5. 用户在改已有任务、完成已有任务但指代不清、或其他高风险写操作时，actions 置空，requires_confirmation 设为 true，并给一句简短中文确认。
+            6. 当用户提到重复、优先级、标签、清单/子任务时，把这些信息放进 payload；不要丢字段。
 
             时间规则：
             - 明确日期+时刻 => semantic_type=explicit_time，并填写 due_at。

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import math
 from zoneinfo import ZoneInfo
 
 from sqlalchemy.orm import Session, sessionmaker
@@ -48,6 +49,7 @@ class ReminderWorker:
     async def _process_user(self, *, user: User, now: datetime) -> None:
         timezone_name = user.current_timezone or "America/Los_Angeles"
         local_now = now.astimezone(ZoneInfo(timezone_name))
+        await self._send_due_pending_events(user=user, now=now)
         tasks = await self._ticktick_client.list_tasks(access_token=user.ticktick_access_token, since=None)
         task_lines = self._build_task_lines(tasks=tasks, timezone_name=timezone_name)
 
@@ -64,6 +66,7 @@ class ReminderWorker:
                 )
 
         await self._send_prestart_reminders(user=user, local_now=local_now, tasks=tasks, timezone_name=timezone_name, now=now)
+        await self._send_windowed_reminders(user=user, local_now=local_now, now=now)
 
         if self._is_trigger_time(local_now, hour=23, minute=30):
             text = self._build_evening_review(local_now=local_now, task_lines=task_lines)
@@ -74,6 +77,13 @@ class ReminderWorker:
                     event_type="evening_review",
                     scheduled_at=local_now.replace(hour=23, minute=30, second=0, microsecond=0),
                     text=text,
+                    payload_json={
+                        "text": text,
+                        "candidate_tasks": self._build_evening_review_candidates(
+                            local_now=local_now,
+                            task_lines=task_lines,
+                        ),
+                    },
                     now=now,
                 )
 
@@ -107,6 +117,12 @@ class ReminderWorker:
                 text=text,
                 now=now,
                 ticktick_task_id=task.id,
+                payload_json={
+                    "text": text,
+                    "task_id": task.id,
+                    "title": task.title,
+                    "task_due_at": task.dueDate,
+                },
             )
 
     def _build_morning_brief(
@@ -163,6 +179,7 @@ class ReminderWorker:
         text: str,
         now: datetime,
         ticktick_task_id: str | None = None,
+        payload_json: dict | None = None,
     ) -> None:
         with self._session_factory() as session:
             reminder_repo = ReminderRepository(session)
@@ -182,13 +199,48 @@ class ReminderWorker:
                     event_type=event_type,
                     scheduled_at=scheduled_at,
                     dedupe_key=dedupe_key,
-                    payload_json={"text": text},
+                    payload_json=payload_json or {"text": text},
                     status="sent",
                     sent_at=now,
                 )
             )
             session.commit()
             reminder_repo.mark_sent(event, sent_at=now)
+
+    async def _send_due_pending_events(self, *, user: User, now: datetime) -> None:
+        with self._session_factory() as session:
+            reminder_repo = ReminderRepository(session)
+            pending_events = reminder_repo.list_due_pending_for_user(user_id=user.id, now=now)
+            for event in pending_events:
+                text = (event.payload_json or {}).get("text")
+                if not text:
+                    continue
+                await self._telegram_client.send_message(chat_id=int(user.telegram_user_id), text=text)
+                reminder_repo.mark_sent(event, sent_at=now)
+            session.commit()
+
+    async def _send_windowed_reminders(self, *, user: User, local_now: datetime, now: datetime) -> None:
+        with self._session_factory() as session:
+            shadows = TaskShadowRepository(session).list_windowed_by_user(user_id=user.id)
+
+        for shadow in shadows:
+            checkpoints = self._windowed_checkpoints(shadow=shadow, timezone_name=user.current_timezone or "America/Los_Angeles")
+            for event_type, scheduled_at in checkpoints:
+                if scheduled_at is None or not self._is_scheduled_window(local_now=local_now, scheduled_at=scheduled_at):
+                    continue
+                title = shadow.normalized_title or "待推进事项"
+                raw_nl_time = shadow.raw_nl_time or "这段时间"
+                text = f"轻轻提醒你一下：{raw_nl_time} 这段时间里，记得推进「{title}」。"
+                await self._send_once(
+                    user=user,
+                    dedupe_key=f"{event_type}:{shadow.ticktick_task_id}:{scheduled_at.isoformat()}",
+                    event_type=event_type,
+                    scheduled_at=scheduled_at,
+                    text=text,
+                    now=now,
+                    ticktick_task_id=shadow.ticktick_task_id,
+                    payload_json={"text": text, "task_id": shadow.ticktick_task_id, "title": title},
+                )
 
     def _build_windowed_items(
         self,
@@ -218,6 +270,15 @@ class ReminderWorker:
         items.sort(key=lambda item: item["sort_key"])
         return items[:8]
 
+    def _build_evening_review_candidates(self, *, local_now: datetime, task_lines: list[dict]) -> list[dict[str, str]]:
+        today_items = [item for item in task_lines if item["date"] == local_now.date().isoformat()]
+        today_items.sort(key=lambda item: item["sort_key"])
+        return [
+            {"task_id": str(item["task_id"]), "title": str(item["title"])}
+            for item in today_items[:8]
+            if item.get("task_id") and item.get("title")
+        ]
+
     def _build_task_lines(self, *, tasks: list[TickTickTask], timezone_name: str) -> list[dict]:
         lines: list[dict] = []
         for task in tasks:
@@ -228,6 +289,7 @@ class ReminderWorker:
                 continue
             lines.append(
                 {
+                    "task_id": task.id,
                     "date": effective_dt.date().isoformat(),
                     "sort_key": effective_dt,
                     "weekday": self._renderer.render_weekday(effective_dt),
@@ -254,3 +316,38 @@ class ReminderWorker:
         scheduled = current_time.replace(hour=hour, minute=minute, second=0, microsecond=0)
         delta = (current_time - scheduled).total_seconds()
         return 0 <= delta < grace_seconds
+
+    def _windowed_checkpoints(self, *, shadow, timezone_name: str) -> list[tuple[str, datetime | None]]:
+        start_at = self._normalize_shadow_datetime(shadow.window_start, timezone_name=timezone_name)
+        end_at = self._normalize_shadow_datetime(shadow.window_end, timezone_name=timezone_name)
+        if start_at is None or end_at is None:
+            return []
+        inclusive_days = (end_at.date() - start_at.date()).days + 1
+        start_ping = start_at.replace(hour=0, minute=0, second=0, microsecond=0)
+        if inclusive_days <= 2:
+            return [("window_start_ping", start_ping)]
+
+        deadline_ping = (end_at - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        if inclusive_days <= 4:
+            return [
+                ("window_start_ping", start_ping),
+                ("window_deadline_ping", deadline_ping),
+            ]
+
+        midpoint_day_offset = max(0, math.ceil(inclusive_days / 2))
+        midpoint = start_at.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=midpoint_day_offset)
+        return [
+            ("window_start_ping", start_ping),
+            ("window_midpoint_ping", midpoint),
+            ("window_deadline_ping", deadline_ping),
+        ]
+
+    def _normalize_shadow_datetime(self, value: datetime | None, *, timezone_name: str) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=ZoneInfo(timezone_name))
+        return value.astimezone(ZoneInfo(timezone_name))
+
+    def _is_scheduled_window(self, *, local_now: datetime, scheduled_at: datetime, grace_seconds: int = 60) -> bool:
+        return local_now.date() == scheduled_at.date()

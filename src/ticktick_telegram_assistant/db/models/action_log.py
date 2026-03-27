@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Optional
 
 from sqlalchemy import DateTime, ForeignKey, JSON, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
@@ -11,10 +12,9 @@ class ActionLog(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
-    source_message_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_message_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     original_text: Mapped[str] = mapped_column(Text)
-    parsed_plan_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
-    execution_result_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    parsed_plan_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    execution_result_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     status: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-

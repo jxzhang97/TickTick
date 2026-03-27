@@ -19,6 +19,7 @@ dependencies = [
   "httpx",
   "openai",
   "apscheduler",
+  "timezonefinder",
 ]
 
 [project.optional-dependencies]
@@ -33,4 +34,3 @@ pythonpath = ["src"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
-

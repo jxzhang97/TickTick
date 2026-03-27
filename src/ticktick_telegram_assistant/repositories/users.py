@@ -1,3 +1,5 @@
+from typing import Optional
+
 from sqlalchemy.orm import Session
 from sqlalchemy import select
 
@@ -8,7 +10,7 @@ class UserRepository:
     def __init__(self, session: Session) -> None:
         self._session = session
 
-    def get_by_telegram_user_id(self, telegram_user_id: str) -> User | None:
+    def get_by_telegram_user_id(self, telegram_user_id: str) -> Optional[User]:
         if self._session is None:
             return None
         return (
@@ -21,7 +23,7 @@ class UserRepository:
         self,
         *,
         telegram_user_id: str,
-        display_name: str | None = None,
+        display_name: Optional[str] = None,
     ) -> User:
         user = self.get_by_telegram_user_id(telegram_user_id)
         if user is not None:

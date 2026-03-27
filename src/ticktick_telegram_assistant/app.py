@@ -12,8 +12,10 @@ from ticktick_telegram_assistant.integrations.ticktick_client import TickTickCli
 from ticktick_telegram_assistant.integrations.ticktick_oauth_client import TickTickOAuthClient
 from ticktick_telegram_assistant.logging import configure_logging
 from ticktick_telegram_assistant.services.conversation_service import ConversationService
+from ticktick_telegram_assistant.services.memory_service import MemoryService
 from ticktick_telegram_assistant.services.task_command_service import TaskCommandService
 from ticktick_telegram_assistant.services.ticktick_oauth_service import TickTickOAuthService
+from ticktick_telegram_assistant.services.timezone_resolver import TimezoneResolver
 from ticktick_telegram_assistant.services.today_brief_service import TodayBriefService
 
 
@@ -37,6 +39,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             token_url=app_settings.ticktick_token_url,
         ),
     )
+    app.state.memory_service = MemoryService(session_factory=app.state.session_factory)
+    app.state.timezone_resolver = TimezoneResolver()
     app.state.conversation_service = ConversationService(
         planner=app.state.openai_planner,
         ticktick_oauth_service=app.state.ticktick_oauth_service,
@@ -48,6 +52,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             session_factory=app.state.session_factory,
             ticktick_client=app.state.ticktick_client,
         ),
+        session_factory=app.state.session_factory,
+        timezone_resolver=app.state.timezone_resolver,
+        memory_service=app.state.memory_service,
+        ticktick_client=app.state.ticktick_client,
     )
     app.include_router(health_router)
     app.include_router(ticktick_oauth_router)

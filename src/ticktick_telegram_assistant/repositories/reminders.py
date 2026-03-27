@@ -36,6 +36,37 @@ class ReminderRepository:
             )
         )
 
+    def get_latest_for_user(
+        self,
+        *,
+        user_id: int,
+        event_types: list[str],
+        statuses: list[str] | None = None,
+    ) -> ReminderEvent | None:
+        if self._session is None:
+            return None
+        statement = select(ReminderEvent).where(
+            ReminderEvent.user_id == user_id,
+            ReminderEvent.event_type.in_(event_types),
+        )
+        if statuses:
+            statement = statement.where(ReminderEvent.status.in_(statuses))
+        statement = statement.order_by(ReminderEvent.created_at.desc(), ReminderEvent.id.desc())
+        return self._session.scalars(statement).first()
+
+    def list_due_pending_for_user(self, *, user_id: int, now: datetime) -> list[ReminderEvent]:
+        if self._session is None:
+            return []
+        return list(
+            self._session.scalars(
+                select(ReminderEvent).where(
+                    ReminderEvent.user_id == user_id,
+                    ReminderEvent.status == "pending",
+                    ReminderEvent.scheduled_at <= now,
+                )
+            )
+        )
+
     def mark_sent(self, reminder_event: ReminderEvent, *, sent_at: datetime) -> ReminderEvent:
         reminder_event.status = "sent"
         reminder_event.sent_at = sent_at

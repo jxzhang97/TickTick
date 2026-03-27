@@ -1,26 +1,26 @@
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
 
 class TickTickTaskRef(BaseModel):
     task_id: str
-    title: str | None = None
+    title: Optional[str] = None
 
 
 class ParsedTimeIntent(BaseModel):
     semantic_type: str
-    due_at: datetime | None = None
-    window_start: datetime | None = None
-    window_end: datetime | None = None
+    due_at: Optional[datetime] = None
+    window_start: Optional[datetime] = None
+    window_end: Optional[datetime] = None
     raw_text: str
 
 
 class ConversationContext(BaseModel):
     user_text: str
     current_timezone: str = "America/Los_Angeles"
-    current_local_time: str | None = None
+    current_local_time: Optional[str] = None
     memory_items: list[str] = Field(default_factory=list)
     candidate_tasks: list[str] = Field(default_factory=list)
 
@@ -31,12 +31,12 @@ class ConversationContext(BaseModel):
 class PlannedConversation(BaseModel):
     actions: list["PlannedAction"] = Field(default_factory=list)
     requires_confirmation: bool = False
-    assistant_reply: str | None = None
+    assistant_reply: Optional[str] = None
 
 
 class PlannedAction(BaseModel):
     action_type: str
-    target_task_id: str | None = None
+    target_task_id: Optional[str] = None
     payload: dict[str, Any] = Field(default_factory=dict)
 
 

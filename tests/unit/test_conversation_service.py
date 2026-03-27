@@ -1,6 +1,16 @@
-import pytest
+from datetime import datetime, timezone
 
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session, sessionmaker
+
+from ticktick_telegram_assistant.db.base import Base
+from ticktick_telegram_assistant.db.models.reminder_event import ReminderEvent
+from ticktick_telegram_assistant.db.models.user import User
+from ticktick_telegram_assistant.domain.enums import MemoryType
 from ticktick_telegram_assistant.domain.schemas import PlannedConversation
+from ticktick_telegram_assistant.integrations.ticktick_client import TickTickTask
+from ticktick_telegram_assistant.services.memory_service import MemoryService
 from ticktick_telegram_assistant.services.conversation_service import (
     ConversationService,
     TelegramUpdate,
@@ -50,6 +60,32 @@ class FakeTodayBriefService:
         return self._brief
 
 
+class FakeTimezoneResolver:
+    def __init__(self, *, location_timezone: str | None = None, text_timezone: str | None = None) -> None:
+        self.location_timezone = location_timezone
+        self.text_timezone = text_timezone
+        self.location_calls: list[dict] = []
+        self.text_calls: list[str] = []
+
+    async def resolve_from_location(self, *, latitude: float, longitude: float) -> str | None:
+        self.location_calls.append({"latitude": latitude, "longitude": longitude})
+        return self.location_timezone
+
+    def resolve_from_text(self, text: str) -> str | None:
+        self.text_calls.append(text)
+        return self.text_timezone
+
+
+class FakeTickTickClient:
+    def __init__(self, tasks: list[TickTickTask] | None = None) -> None:
+        self.tasks = tasks or []
+        self.calls: list[dict] = []
+
+    async def list_tasks(self, *, access_token: str, since=None) -> list[TickTickTask]:
+        self.calls.append({"method": "list_tasks", "access_token": access_token, "since": since})
+        return list(self.tasks)
+
+
 class FakeTaskCommandService:
     def __init__(
         self,
@@ -65,6 +101,12 @@ class FakeTaskCommandService:
             action.target_task_id = self.created_task_id
         self.calls.append({"telegram_user_id": telegram_user_id, "action": action, "now": now})
         return self.reply_text
+
+
+def make_session_factory() -> sessionmaker[Session]:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    return sessionmaker(bind=engine, class_=Session, expire_on_commit=False)
 
 
 @pytest.mark.asyncio
@@ -494,3 +536,535 @@ async def test_handle_update_returns_single_oauth_prompt_for_multiline_batch_whe
             "display_name": None,
         },
     ]
+
+
+@pytest.mark.asyncio
+async def test_handle_update_executes_evening_review_reply_from_saved_reminder_context() -> None:
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        user = User(
+            telegram_user_id="99",
+            display_name="Jiaxin",
+            current_timezone="America/Los_Angeles",
+            ticktick_access_token="access-token",
+        )
+        session.add(user)
+        session.flush()
+        session.add(
+            ReminderEvent(
+                user_id=user.id,
+                ticktick_task_id=None,
+                event_type="evening_review",
+                scheduled_at=datetime(2026, 3, 27, 23, 30, tzinfo=timezone.utc),
+                dedupe_key="evening-review-2026-03-27",
+                status="sent",
+                sent_at=datetime(2026, 3, 28, 6, 30, tzinfo=timezone.utc),
+                payload_json={
+                    "candidate_tasks": [
+                        {"task_id": "task-1", "title": "写周报"},
+                        {"task_id": "task-2", "title": "回导师邮件"},
+                        {"task_id": "task-3", "title": "整理实验记录"},
+                    ]
+                },
+            )
+        )
+        session.commit()
+
+    planner = FakePlanner(
+        PlannedConversation(
+            actions=[
+                {
+                    "action_type": "update_task",
+                    "payload": {
+                        "match_title": "整理实验记录",
+                        "due_at": "2026-03-28T15:00:00-07:00",
+                    },
+                }
+            ]
+        )
+    )
+
+    class SequencedTaskCommandService(FakeTaskCommandService):
+        async def execute_action(self, *, telegram_user_id: str, action, now=None) -> str:
+            self.calls.append({"telegram_user_id": telegram_user_id, "action": action, "now": now})
+            mapping = {
+                "complete_task": f"done:{action.target_task_id}",
+                "update_task": f"updated:{action.target_task_id}",
+            }
+            return mapping[action.action_type]
+
+    task_command_service = SequencedTaskCommandService()
+    service = ConversationService(
+        planner=planner,
+        task_command_service=task_command_service,
+        session_factory=session_factory,
+    )
+    update = TelegramUpdate.model_validate(
+        {
+            "update_id": 12,
+            "message": {
+                "message_id": 18,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "前两个做完了，第三个改到周四下午",
+            },
+        }
+    )
+
+    replies = await service.handle_update(update)
+
+    assert [reply.text for reply in replies] == ["done:task-1\ndone:task-2\nupdated:task-3"]
+    assert [call["action"].action_type for call in task_command_service.calls] == [
+        "complete_task",
+        "complete_task",
+        "update_task",
+    ]
+    assert [call["action"].target_task_id for call in task_command_service.calls] == [
+        "task-1",
+        "task-2",
+        "task-3",
+    ]
+    assert planner.contexts[0].user_text == "任务“整理实验记录”改到周四下午"
+
+
+@pytest.mark.asyncio
+async def test_handle_update_schedules_snooze_from_latest_reminder_context() -> None:
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        user = User(
+            telegram_user_id="99",
+            display_name="Jiaxin",
+            current_timezone="America/Los_Angeles",
+            ticktick_access_token="access-token",
+        )
+        session.add(user)
+        session.flush()
+        session.add(
+            ReminderEvent(
+                user_id=user.id,
+                ticktick_task_id="task-1",
+                event_type="prestart_reminder",
+                scheduled_at=datetime(2026, 3, 27, 14, 55, tzinfo=timezone.utc),
+                dedupe_key="prestart-task-1",
+                status="sent",
+                sent_at=datetime(2026, 3, 27, 14, 55, tzinfo=timezone.utc),
+                payload_json={
+                    "task_id": "task-1",
+                    "title": "给导师A发邮件",
+                    "task_due_at": "2026-03-29T15:00:00-07:00",
+                },
+            )
+        )
+        session.commit()
+
+    service = ConversationService(session_factory=session_factory)
+    update = TelegramUpdate.model_validate(
+        {
+            "update_id": 13,
+            "message": {
+                "message_id": 19,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "1小时后再提醒我",
+            },
+        }
+    )
+
+    replies = await service.handle_update(update)
+
+    assert len(replies) == 1
+    assert "1小时后" in replies[0].text
+    with session_factory() as session:
+        events = session.query(ReminderEvent).order_by(ReminderEvent.id).all()
+        assert len(events) == 2
+        snoozed = events[-1]
+        assert snoozed.event_type == "snoozed_reminder"
+        assert snoozed.status == "pending"
+        assert snoozed.ticktick_task_id == "task-1"
+        assert snoozed.payload_json["task_due_at"] == "2026-03-29T15:00:00-07:00"
+        assert snoozed.scheduled_at.isoformat().startswith("2026-03-29T23:00:00")
+
+
+@pytest.mark.asyncio
+async def test_handle_update_updates_timezone_from_location() -> None:
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        session.add(
+            User(
+                telegram_user_id="99",
+                display_name="Jiaxin",
+                current_timezone="America/Los_Angeles",
+            )
+        )
+        session.commit()
+
+    timezone_resolver = FakeTimezoneResolver(location_timezone="America/New_York")
+    service = ConversationService(
+        session_factory=session_factory,
+        timezone_resolver=timezone_resolver,
+    )
+    update = TelegramUpdate.model_validate(
+        {
+            "update_id": 14,
+            "message": {
+                "message_id": 20,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "location": {"latitude": 40.7128, "longitude": -74.0060},
+            },
+        }
+    )
+
+    replies = await service.handle_update(update)
+
+    assert len(replies) == 1
+    assert "America/New_York" in replies[0].text
+    assert timezone_resolver.location_calls == [{"latitude": 40.7128, "longitude": -74.006}]
+    with session_factory() as session:
+        user = session.query(User).filter(User.telegram_user_id == "99").one()
+        assert user.current_timezone == "America/New_York"
+        assert user.timezone_source == "location"
+
+
+@pytest.mark.asyncio
+async def test_handle_update_updates_timezone_from_text() -> None:
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        session.add(
+            User(
+                telegram_user_id="99",
+                display_name="Jiaxin",
+                current_timezone="America/Los_Angeles",
+            )
+        )
+        session.commit()
+
+    timezone_resolver = FakeTimezoneResolver(text_timezone="Asia/Shanghai")
+    service = ConversationService(
+        session_factory=session_factory,
+        timezone_resolver=timezone_resolver,
+    )
+    update = TelegramUpdate.model_validate(
+        {
+            "update_id": 15,
+            "message": {
+                "message_id": 21,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "以后按北京时间提醒我",
+            },
+        }
+    )
+
+    replies = await service.handle_update(update)
+
+    assert len(replies) == 1
+    assert "Asia/Shanghai" in replies[0].text
+    with session_factory() as session:
+        user = session.query(User).filter(User.telegram_user_id == "99").one()
+        assert user.current_timezone == "Asia/Shanghai"
+        assert user.timezone_source == "text"
+
+
+@pytest.mark.asyncio
+async def test_handle_update_builds_planner_context_from_memory_service() -> None:
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        user = User(
+            telegram_user_id="99",
+            display_name="Jiaxin",
+            current_timezone="America/Los_Angeles",
+        )
+        session.add(user)
+        session.flush()
+        user_id = user.id
+        session.commit()
+
+    memory_service = MemoryService(session_factory=session_factory)
+    memory_service.upsert_fact(
+        user_id=user_id,
+        key="fun list",
+        value_json={"canonical_name": "fun"},
+        memory_type=MemoryType.ALIAS_MAPPING,
+    )
+    planner = FakePlanner(PlannedConversation(assistant_reply="ok"))
+    service = ConversationService(
+        planner=planner,
+        session_factory=session_factory,
+        memory_service=memory_service,
+    )
+
+    update = TelegramUpdate.model_validate(
+        {
+            "update_id": 15,
+            "message": {
+                "message_id": 21,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "放到 fun 那个 list",
+            },
+        }
+    )
+
+    await service.handle_update(update)
+
+    assert planner.contexts[0].memory_items == ["alias_mapping: fun list -> fun"]
+
+
+@pytest.mark.asyncio
+async def test_handle_update_persists_active_task_context_in_memory_service() -> None:
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        user = User(
+            telegram_user_id="99",
+            display_name="Jiaxin",
+            current_timezone="America/Los_Angeles",
+        )
+        session.add(user)
+        session.flush()
+        user_id = user.id
+        session.commit()
+
+    planner = FakePlanner(
+        PlannedConversation(
+            actions=[
+                {
+                    "action_type": "create_task",
+                    "payload": {
+                        "title": "给导师发邮件",
+                        "semantic_type": "memo",
+                    },
+                }
+            ]
+        )
+    )
+    memory_service = MemoryService(session_factory=session_factory)
+    task_command_service = FakeTaskCommandService(created_task_id="task-memory-1")
+    service = ConversationService(
+        planner=planner,
+        task_command_service=task_command_service,
+        session_factory=session_factory,
+        memory_service=memory_service,
+    )
+    update = TelegramUpdate.model_validate(
+        {
+            "update_id": 16,
+            "message": {
+                "message_id": 22,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "提醒我给导师发邮件",
+            },
+        }
+    )
+
+    await service.handle_update(update)
+
+    context = memory_service.get_active_context(user_id=user_id, context_type="active_task")
+    assert context is not None
+    assert context.payload_json == {"title": "给导师发邮件", "task_id": "task-memory-1"}
+
+
+@pytest.mark.asyncio
+async def test_handle_update_requests_confirmation_for_duplicate_create() -> None:
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        session.add(
+            User(
+                telegram_user_id="99",
+                display_name="Jiaxin",
+                current_timezone="America/Los_Angeles",
+                ticktick_access_token="access-token",
+            )
+        )
+        session.commit()
+
+    planner = FakePlanner(
+        PlannedConversation(
+            actions=[
+                {
+                    "action_type": "create_task",
+                    "payload": {
+                        "title": "给导师A发邮件",
+                        "semantic_type": "explicit_time",
+                        "due_at": "2026-03-29T15:00:00-07:00",
+                    },
+                }
+            ]
+        )
+    )
+    task_command_service = FakeTaskCommandService("should-not-run")
+    ticktick_client = FakeTickTickClient(
+        tasks=[
+            TickTickTask(
+                id="existing-1",
+                projectId="telegram-inbox",
+                title="给导师A发邮件",
+                dueDate="2026-03-29T15:00:00.000-0700",
+                status=0,
+            )
+        ]
+    )
+    memory_service = MemoryService(session_factory=session_factory)
+    service = ConversationService(
+        planner=planner,
+        task_command_service=task_command_service,
+        session_factory=session_factory,
+        ticktick_client=ticktick_client,
+        memory_service=memory_service,
+    )
+
+    update = TelegramUpdate.model_validate(
+        {
+            "update_id": 17,
+            "message": {
+                "message_id": 23,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "明天下午3点提醒我给导师A发邮件",
+            },
+        }
+    )
+
+    replies = await service.handle_update(update)
+
+    assert len(replies) == 1
+    assert "很像" in replies[0].text
+    assert task_command_service.calls == []
+    with session_factory() as session:
+        user = session.query(User).filter(User.telegram_user_id == "99").one()
+    context = memory_service.get_active_context(user_id=user.id, context_type="pending_confirmation")
+    assert context is not None
+    assert context.payload_json["kind"] == "duplicate_create"
+    assert context.payload_json["candidate_task"]["task_id"] == "existing-1"
+
+
+@pytest.mark.asyncio
+async def test_handle_update_executes_confirmation_reply_for_duplicate_create_merge() -> None:
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        user = User(
+            telegram_user_id="99",
+            display_name="Jiaxin",
+            current_timezone="America/Los_Angeles",
+            ticktick_access_token="access-token",
+        )
+        session.add(user)
+        session.flush()
+        user_id = user.id
+        session.commit()
+
+    memory_service = MemoryService(session_factory=session_factory)
+    memory_service.replace_active_context(
+        user_id=user_id,
+        context_type="pending_confirmation",
+        payload_json={
+            "kind": "duplicate_create",
+            "candidate_task": {"task_id": "existing-1", "title": "给导师A发邮件"},
+            "original_action": {
+                "action_type": "create_task",
+                "payload": {
+                    "title": "给导师A发邮件",
+                    "description": "记得带附件",
+                    "semantic_type": "memo",
+                },
+            },
+        },
+    )
+
+    task_command_service = FakeTaskCommandService("merged")
+    service = ConversationService(
+        task_command_service=task_command_service,
+        session_factory=session_factory,
+        memory_service=memory_service,
+    )
+    update = TelegramUpdate.model_validate(
+        {
+            "update_id": 18,
+            "message": {
+                "message_id": 24,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "合并到原来那条",
+            },
+        }
+    )
+
+    replies = await service.handle_update(update)
+
+    assert [reply.text for reply in replies] == ["merged"]
+    assert len(task_command_service.calls) == 1
+    action = task_command_service.calls[0]["action"]
+    assert action.action_type == "update_task"
+    assert action.target_task_id == "existing-1"
+    assert action.payload["match_title"] == "给导师A发邮件"
+    assert action.payload["description"] == "记得带附件"
+    assert memory_service.get_active_context(user_id=user_id, context_type="pending_confirmation") is None
+
+
+@pytest.mark.asyncio
+async def test_handle_update_requests_confirmation_for_time_conflict() -> None:
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        session.add(
+            User(
+                telegram_user_id="99",
+                display_name="Jiaxin",
+                current_timezone="America/Los_Angeles",
+                ticktick_access_token="access-token",
+            )
+        )
+        session.commit()
+
+    planner = FakePlanner(
+        PlannedConversation(
+            actions=[
+                {
+                    "action_type": "create_task",
+                    "payload": {
+                        "title": "给导师A发邮件",
+                        "semantic_type": "explicit_time",
+                        "due_at": "2026-03-29T15:00:00-07:00",
+                    },
+                }
+            ]
+        )
+    )
+    ticktick_client = FakeTickTickClient(
+        tasks=[
+            TickTickTask(
+                id="existing-2",
+                projectId="telegram-inbox",
+                title="周会",
+                dueDate="2026-03-29T15:30:00.000-0700",
+                status=0,
+            )
+        ]
+    )
+    task_command_service = FakeTaskCommandService("should-not-run")
+    service = ConversationService(
+        planner=planner,
+        task_command_service=task_command_service,
+        session_factory=session_factory,
+        ticktick_client=ticktick_client,
+        memory_service=MemoryService(session_factory=session_factory),
+    )
+
+    update = TelegramUpdate.model_validate(
+        {
+            "update_id": 19,
+            "message": {
+                "message_id": 25,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "明天下午3点提醒我给导师A发邮件",
+            },
+        }
+    )
+
+    replies = await service.handle_update(update)
+
+    assert len(replies) == 1
+    assert "撞上了" in replies[0].text
+    assert "周会" in replies[0].text
+    assert task_command_service.calls == []

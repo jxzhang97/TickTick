@@ -7,6 +7,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from ticktick_telegram_assistant.db.base import Base
+from ticktick_telegram_assistant.db.models.reminder_event import ReminderEvent
 from ticktick_telegram_assistant.db.models.task_shadow import TaskShadow
 from ticktick_telegram_assistant.db.models.user import User
 from ticktick_telegram_assistant.integrations.ticktick_client import TickTickTask
@@ -144,6 +145,12 @@ async def test_reminder_worker_sends_prestart_reminder_once() -> None:
     assert len(telegram_client.sent_messages) == 1
     assert "还有 5 分钟" in telegram_client.sent_messages[0]["text"]
     assert "周五讨论" in telegram_client.sent_messages[0]["text"]
+    with session_factory() as session:
+        reminder = session.query(ReminderEvent).one()
+        assert reminder.event_type == "prestart_reminder"
+        assert reminder.payload_json["task_id"] == "t1"
+        assert reminder.payload_json["title"] == "周五讨论"
+        assert reminder.payload_json["task_due_at"] == "2026-03-27T21:00:00.000+0000"
 
 
 @pytest.mark.asyncio
@@ -188,3 +195,101 @@ async def test_reminder_worker_sends_evening_review_once() -> None:
     message = telegram_client.sent_messages[0]["text"]
     assert "今天这些事哪些已经做完了" in message
     assert "周五讨论" in message
+    with session_factory() as session:
+        reminder = session.query(ReminderEvent).one()
+        assert reminder.event_type == "evening_review"
+        assert reminder.payload_json["candidate_tasks"] == [
+            {"task_id": "t1", "title": "周五讨论"}
+        ]
+
+
+@pytest.mark.asyncio
+async def test_reminder_worker_sends_windowed_progress_pings() -> None:
+    from ticktick_telegram_assistant.workers.reminder_worker import ReminderWorker
+
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        user = User(
+            telegram_user_id="99",
+            display_name="Jiaxin",
+            current_timezone="America/Los_Angeles",
+            ticktick_access_token="access-token",
+        )
+        session.add(user)
+        session.flush()
+        session.add(
+            TaskShadow(
+                user_id=user.id,
+                ticktick_task_id="window-1",
+                semantic_type="windowed",
+                normalized_title="把周报框架补完",
+                raw_nl_time="下周",
+                window_start=datetime.fromisoformat("2026-03-30T00:00:00"),
+                window_end=datetime.fromisoformat("2026-04-05T23:59:00"),
+            )
+        )
+        session.commit()
+
+    ticktick_client = FakeTickTickClient([])
+    telegram_client = FakeTelegramClient()
+    worker = ReminderWorker(
+        session_factory=session_factory,
+        ticktick_client=ticktick_client,
+        telegram_client=telegram_client,
+    )
+
+    await worker.run_once(now=datetime.fromisoformat("2026-03-30T00:00:10-07:00"))
+    await worker.run_once(now=datetime.fromisoformat("2026-04-03T12:00:10-07:00"))
+    await worker.run_once(now=datetime.fromisoformat("2026-04-04T00:00:10-07:00"))
+
+    assert len(telegram_client.sent_messages) == 3
+    assert "下周" in telegram_client.sent_messages[0]["text"]
+    assert "把周报框架补完" in telegram_client.sent_messages[0]["text"]
+    assert "把周报框架补完" in telegram_client.sent_messages[1]["text"]
+    assert "把周报框架补完" in telegram_client.sent_messages[2]["text"]
+
+
+@pytest.mark.asyncio
+async def test_reminder_worker_sends_due_pending_snooze_event() -> None:
+    from ticktick_telegram_assistant.workers.reminder_worker import ReminderWorker
+
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        user = User(
+            telegram_user_id="99",
+            display_name="Jiaxin",
+            current_timezone="America/Los_Angeles",
+            ticktick_access_token="access-token",
+        )
+        session.add(user)
+        session.flush()
+        session.add(
+            ReminderEvent(
+                user_id=user.id,
+                ticktick_task_id="task-1",
+                event_type="snoozed_reminder",
+                scheduled_at=datetime.fromisoformat("2026-03-29T16:00:00-07:00"),
+                dedupe_key="snooze:task-1:2026-03-29T16:00:00-07:00",
+                status="pending",
+                payload_json={"text": "今晚 8 点再提醒：给导师A发邮件"},
+            )
+        )
+        session.commit()
+
+    ticktick_client = FakeTickTickClient([])
+    telegram_client = FakeTelegramClient()
+    worker = ReminderWorker(
+        session_factory=session_factory,
+        ticktick_client=ticktick_client,
+        telegram_client=telegram_client,
+    )
+
+    await worker.run_once(now=datetime.fromisoformat("2026-03-29T16:00:10-07:00"))
+
+    assert telegram_client.sent_messages == [
+        {"chat_id": 99, "text": "今晚 8 点再提醒：给导师A发邮件"}
+    ]
+    with session_factory() as session:
+        reminder = session.query(ReminderEvent).one()
+        assert reminder.status == "sent"
+        assert reminder.sent_at is not None

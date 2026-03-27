@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Optional
 
 from sqlalchemy import DateTime, Float, ForeignKey, JSON, String, func
 from sqlalchemy.orm import Mapped, mapped_column
@@ -15,8 +16,7 @@ class MemoryFact(Base):
     key: Mapped[str] = mapped_column(String(255), index=True)
     value_json: Mapped[dict] = mapped_column(JSON)
     confidence: Mapped[float] = mapped_column(Float, default=1.0)
-    source_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    last_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    source_type: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    last_confirmed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-

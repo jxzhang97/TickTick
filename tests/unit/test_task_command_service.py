@@ -144,6 +144,68 @@ async def test_execute_action_creates_explicit_time_task_and_shadow() -> None:
 
 
 @pytest.mark.asyncio
+async def test_execute_action_creates_task_with_repeat_priority_tags_and_checklist() -> None:
+    from ticktick_telegram_assistant.services.task_command_service import TaskCommandService
+
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        session.add(
+            User(
+                telegram_user_id="99",
+                display_name="Jiaxin",
+                current_timezone="America/Los_Angeles",
+                ticktick_access_token="access-token",
+            )
+        )
+        session.commit()
+
+    client = FakeTickTickClient()
+    service = TaskCommandService(session_factory=session_factory, ticktick_client=client)
+
+    reply = await service.execute_action(
+        telegram_user_id="99",
+        action=PlannedAction(
+            action_type="create_task",
+            payload={
+                "title": "每周同步",
+                "semantic_type": "explicit_time",
+                "due_at": "2026-03-30T10:00:00-07:00",
+                "repeat_rule": "FREQ=WEEKLY;BYDAY=MO",
+                "priority": 3,
+                "tags": ["work", "weekly"],
+                "subtasks": ["准备议程", "发纪要"],
+            },
+        ),
+    )
+
+    assert "重复规则" in reply
+    assert "已尝试同步标签" in reply
+    assert client.calls == [
+        {"method": "list_projects", "access_token": "access-token"},
+        {
+            "method": "create_task",
+            "access_token": "access-token",
+            "task": {
+                "title": "每周同步",
+                "projectId": "telegram-inbox",
+                "content": "",
+                "desc": "",
+                "dueDate": "2026-03-30T10:00:00-0700",
+                "timeZone": "America/Los_Angeles",
+                "reminders": [],
+                "repeatFlag": "FREQ=WEEKLY;BYDAY=MO",
+                "priority": 3,
+                "items": [
+                    {"title": "准备议程"},
+                    {"title": "发纪要"},
+                ],
+                "tags": ["work", "weekly"],
+            },
+        },
+    ]
+
+
+@pytest.mark.asyncio
 async def test_execute_action_creates_windowed_task_with_shadow_metadata() -> None:
     from ticktick_telegram_assistant.services.task_command_service import TaskCommandService
 
@@ -339,6 +401,70 @@ async def test_execute_action_updates_unique_task_time_and_description() -> None
             },
         },
     ]
+
+
+@pytest.mark.asyncio
+async def test_execute_action_updates_repeat_rule_tags_and_checklist() -> None:
+    from ticktick_telegram_assistant.services.task_command_service import TaskCommandService
+
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        session.add(
+            User(
+                telegram_user_id="99",
+                display_name="Jiaxin",
+                current_timezone="America/Los_Angeles",
+                ticktick_access_token="access-token",
+            )
+        )
+        session.commit()
+
+    client = FakeTickTickClient()
+    client.tasks = [
+        TickTickTask(
+            id="task-1",
+            projectId="telegram-inbox",
+            title="weekly sync",
+            desc="原说明",
+            status=0,
+        )
+    ]
+    service = TaskCommandService(session_factory=session_factory, ticktick_client=client)
+
+    reply = await service.execute_action(
+        telegram_user_id="99",
+        action=PlannedAction(
+            action_type="update_task",
+            payload={
+                "match_title": "weekly sync",
+                "repeat_rule": "FREQ=WEEKLY;BYDAY=MO",
+                "priority": 2,
+                "tags": ["team"],
+                "subtasks": ["准备议程"],
+            },
+        ),
+    )
+
+    assert "重复规则" in reply
+    assert "已尝试同步标签" in reply
+    assert client.calls == [
+        {"method": "list_tasks", "access_token": "access-token", "since": None},
+            {
+                "method": "update_task",
+                "access_token": "access-token",
+                "task_id": "task-1",
+                "patch": {
+                    "id": "task-1",
+                    "projectId": "telegram-inbox",
+                    "repeatFlag": "FREQ=WEEKLY;BYDAY=MO",
+                    "priority": 2,
+                    "items": [
+                        {"title": "准备议程"},
+                    ],
+                    "tags": ["team"],
+                },
+            },
+        ]
 
 
 @pytest.mark.asyncio

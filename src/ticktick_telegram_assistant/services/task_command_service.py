@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Any, Optional, Union
 
 from sqlalchemy.orm import Session, sessionmaker
 
 from ticktick_telegram_assistant.db.models.task_shadow import TaskShadow
 from ticktick_telegram_assistant.domain.schemas import PlannedAction
 from ticktick_telegram_assistant.integrations.ticktick_client import (
+    TickTickChecklistItem,
     TickTickProject,
     TickTickTask,
     TickTickTaskCreate,
@@ -23,7 +25,7 @@ class TaskCommandService:
         *,
         session_factory: sessionmaker[Session],
         ticktick_client,
-        message_renderer: MessageRenderer | None = None,
+        message_renderer: Optional[MessageRenderer] = None,
     ) -> None:
         self._session_factory = session_factory
         self._ticktick_client = ticktick_client
@@ -34,7 +36,7 @@ class TaskCommandService:
         *,
         telegram_user_id: str,
         action: PlannedAction,
-        now: datetime | None = None,
+        now: Optional[datetime] = None,
     ) -> str:
         if action.action_type == "create_task":
             return await self._create_task(telegram_user_id=telegram_user_id, action=action)
@@ -68,6 +70,10 @@ class TaskCommandService:
         window_start = self._coerce_datetime(action.payload.get("window_start"))
         window_end = self._coerce_datetime(action.payload.get("window_end"))
         raw_nl_time = self._clean_optional_text(action.payload.get("raw_nl_time"))
+        repeat_rule = self._clean_optional_text(action.payload.get("repeat_rule") or action.payload.get("repeatFlag"))
+        priority = self._coerce_priority(action.payload.get("priority"))
+        tags = self._normalize_tags(action.payload.get("tags"))
+        checklist_items = self._extract_checklist_items(action.payload)
         description = self._build_description(
             description=self._clean_optional_text(action.payload.get("description")),
             semantic_type=semantic_type,
@@ -81,6 +87,10 @@ class TaskCommandService:
             dueDate=self._format_ticktick_datetime(due_at) if due_at is not None else None,
             startDate=self._format_ticktick_datetime(start_at) if start_at is not None else None,
             timeZone=timezone_name if (due_at or start_at) else None,
+            repeatFlag=repeat_rule,
+            priority=priority,
+            items=checklist_items,
+            tags=tags or None,
         )
         created = await self._ticktick_client.create_task(access_token=access_token, task=create_payload)
         action.target_task_id = created.id
@@ -93,6 +103,7 @@ class TaskCommandService:
                     semantic_type=semantic_type,
                     normalized_title=title,
                     list_name=project.name,
+                    tags_json=tags or None,
                     due_at=due_at,
                     start_at=start_at,
                     window_start=window_start,
@@ -109,14 +120,19 @@ class TaskCommandService:
             semantic_type=semantic_type,
             due_at=due_at,
             raw_nl_time=raw_nl_time,
+            notes=self._build_advanced_field_notes(
+                repeat_rule=repeat_rule,
+                tags=tags,
+                checklist_items=checklist_items,
+            ),
         )
 
     def _select_project(
         self,
         *,
         projects: list[TickTickProject],
-        requested_name: object | None,
-    ) -> TickTickProject | None:
+        requested_name: Optional[object],
+    ) -> Optional[TickTickProject]:
         cleaned_requested_name = self._clean_optional_text(requested_name)
         if cleaned_requested_name:
             lowered = cleaned_requested_name.casefold()
@@ -137,10 +153,10 @@ class TaskCommandService:
     def _build_description(
         self,
         *,
-        description: str | None,
+        description: Optional[str],
         semantic_type: str,
-        raw_nl_time: str | None,
-    ) -> str | None:
+        raw_nl_time: Optional[str],
+    ) -> Optional[str]:
         lines: list[str] = []
         if description:
             lines.append(description)
@@ -153,17 +169,20 @@ class TaskCommandService:
         *,
         title: str,
         semantic_type: str,
-        due_at: datetime | None,
-        raw_nl_time: str | None,
+        due_at: Optional[datetime],
+        raw_nl_time: Optional[str],
+        notes: Optional[list[str]] = None,
     ) -> str:
         if semantic_type == "explicit_time" and due_at is not None:
-            return (
+            base_reply = (
                 "好，我已经替你记进 TickTick 了："
                 f"{self._message_renderer.render_weekday(due_at)} {due_at.strftime('%H:%M')} {title}"
             )
-        if semantic_type == "windowed" and raw_nl_time:
-            return f"好，我先把这条按时间窗口任务记进 TickTick 了：{raw_nl_time} {title}"
-        return f"好，我已经替你记进 TickTick 了：{title}"
+        elif semantic_type == "windowed" and raw_nl_time:
+            base_reply = f"好，我先把这条按时间窗口任务记进 TickTick 了：{raw_nl_time} {title}"
+        else:
+            base_reply = f"好，我已经替你记进 TickTick 了：{title}"
+        return self._append_notes(base_reply, notes)
 
     async def _complete_task(self, *, telegram_user_id: str, action: PlannedAction) -> str:
         title = self._clean_optional_text(action.payload.get("title"))
@@ -216,7 +235,7 @@ class TaskCommandService:
         target_task = match_or_reply
         requested_list_name = self._clean_optional_text(action.payload.get("list_name"))
         target_project_id = target_task.projectId
-        target_list_name: str | None = None
+        target_list_name: Optional[str] = None
         if requested_list_name:
             projects = await self._ticktick_client.list_projects(access_token=access_token)
             target_project = self._select_project(projects=projects, requested_name=requested_list_name)
@@ -230,6 +249,10 @@ class TaskCommandService:
         due_at = self._coerce_datetime(action.payload.get("due_at"))
         start_at = self._coerce_datetime(action.payload.get("start_at"))
         raw_nl_time = self._clean_optional_text(action.payload.get("raw_nl_time"))
+        repeat_rule = self._clean_optional_text(action.payload.get("repeat_rule") or action.payload.get("repeatFlag"))
+        priority = self._coerce_priority(action.payload.get("priority"))
+        tags = self._normalize_tags(action.payload.get("tags"))
+        checklist_items = self._extract_checklist_items(action.payload)
         new_title = self._clean_optional_text(action.payload.get("title"))
         if new_title and match_title and self._normalize_title(new_title) == self._normalize_title(match_title):
             new_title = None
@@ -246,6 +269,10 @@ class TaskCommandService:
             and updated_description is None
             and new_title is None
             and target_project_id == target_task.projectId
+            and not repeat_rule
+            and priority is None
+            and not tags
+            and not checklist_items
         ):
             return "我理解成你要改这条任务，但还没抓稳具体要改什么。"
 
@@ -257,6 +284,10 @@ class TaskCommandService:
             dueDate=self._format_ticktick_datetime(due_at) if due_at is not None else None,
             startDate=self._format_ticktick_datetime(start_at) if start_at is not None else None,
             timeZone=timezone_name if (due_at or start_at) else None,
+            repeatFlag=repeat_rule,
+            priority=priority,
+            items=checklist_items or None,
+            tags=tags or None,
         )
         await self._ticktick_client.update_task(
             access_token=access_token,
@@ -280,6 +311,7 @@ class TaskCommandService:
                 TaskShadowRepository(session).add(shadow)
             shadow.normalized_title = new_title or target_task.title
             shadow.list_name = target_list_name or shadow.list_name
+            shadow.tags_json = tags or shadow.tags_json
             shadow.due_at = due_at or shadow.due_at
             shadow.start_at = start_at or shadow.start_at
             shadow.raw_nl_time = raw_nl_time or shadow.raw_nl_time
@@ -292,16 +324,21 @@ class TaskCommandService:
             due_at=due_at,
             description_changed=updated_description is not None,
             moved_list_name=target_list_name,
+            notes=self._build_advanced_field_notes(
+                repeat_rule=repeat_rule,
+                tags=tags,
+                checklist_items=checklist_items,
+            ),
         )
 
     def _resolve_open_task(
         self,
         *,
         tasks: list[TickTickTask],
-        requested_title: str | None,
-        target_task_id: str | None,
+        requested_title: Optional[str],
+        target_task_id: Optional[str],
         missing_message: str,
-    ) -> TickTickTask | str:
+    ) -> Union[TickTickTask, str]:
         open_tasks = [task for task in tasks if not task.completed and (task.status is None or task.status == 0)]
         if target_task_id:
             for task in open_tasks:
@@ -331,7 +368,7 @@ class TaskCommandService:
             return f"我找到几条和“{requested_title}”很像的未完成任务。你是指哪一条？"
         return missing_message
 
-    def _coerce_datetime(self, value: object | None) -> datetime | None:
+    def _coerce_datetime(self, value: Optional[object]) -> Optional[datetime]:
         if value is None or value == "":
             return None
         if isinstance(value, datetime):
@@ -341,10 +378,19 @@ class TaskCommandService:
         normalized = value.strip().replace("Z", "+00:00")
         return datetime.fromisoformat(normalized)
 
+    def _coerce_priority(self, value: Optional[object]) -> Optional[int]:
+        cleaned = self._clean_optional_text(value)
+        if cleaned is None:
+            return None
+        try:
+            return int(cleaned)
+        except (TypeError, ValueError):
+            return None
+
     def _format_ticktick_datetime(self, value: datetime) -> str:
         return value.strftime("%Y-%m-%dT%H:%M:%S%z")
 
-    def _clean_optional_text(self, value: object | None) -> str | None:
+    def _clean_optional_text(self, value: Optional[object]) -> Optional[str]:
         if value is None:
             return None
         text = str(value).strip()
@@ -353,26 +399,101 @@ class TaskCommandService:
     def _normalize_title(self, text: str) -> str:
         return "".join(text.casefold().split())
 
+    def _normalize_tags(self, value: Optional[object]) -> list[str]:
+        if value is None:
+            return []
+        raw_items: list[object]
+        if isinstance(value, (list, tuple, set)):
+            raw_items = list(value)
+        elif isinstance(value, str):
+            raw_items = [part.strip() for part in value.split(",")]
+        else:
+            raw_items = [value]
+
+        tags: list[str] = []
+        for item in raw_items:
+            text = self._clean_optional_text(item)
+            if text and text not in tags:
+                tags.append(text)
+        return tags
+
+    def _extract_checklist_items(self, payload: dict[str, Any]) -> list[TickTickChecklistItem]:
+        raw_items = payload.get("subtasks")
+        if raw_items is None:
+            raw_items = payload.get("checklist")
+        if raw_items is None:
+            raw_items = payload.get("items")
+        if raw_items is None:
+            return []
+        if isinstance(raw_items, (str, bytes)):
+            candidates = [raw_items]
+        elif isinstance(raw_items, list):
+            candidates = raw_items
+        else:
+            return []
+
+        checklist_items: list[TickTickChecklistItem] = []
+        for candidate in candidates:
+            if isinstance(candidate, TickTickChecklistItem):
+                checklist_items.append(candidate)
+                continue
+            if isinstance(candidate, dict):
+                title = self._clean_optional_text(candidate.get("title"))
+                if not title:
+                    continue
+                item_kwargs: dict[str, Any] = {"title": title}
+                for key in ("id", "status", "completedTime", "isAllDay", "sortOrder", "startDate", "timeZone"):
+                    if key in candidate and candidate[key] is not None:
+                        item_kwargs[key] = candidate[key]
+                checklist_items.append(TickTickChecklistItem(**item_kwargs))
+                continue
+            title = self._clean_optional_text(candidate)
+            if title:
+                checklist_items.append(TickTickChecklistItem(title=title))
+        return checklist_items
+
     def _merge_description(
         self,
         *,
         current_description: str,
-        new_description: str | None,
+        new_description: Optional[str],
         mode: str,
-    ) -> str | None:
+    ) -> Optional[str]:
         if new_description is None:
             return None
         if mode == "append" and current_description.strip():
             return f"{current_description.rstrip()}\n{new_description}"
         return new_description
 
+    def _build_advanced_field_notes(
+        self,
+        *,
+        repeat_rule: Optional[str],
+        tags: list[str],
+        checklist_items: list[TickTickChecklistItem],
+    ) -> list[str]:
+        notes: list[str] = []
+        if repeat_rule:
+            notes.append(f"重复规则已设置为 {repeat_rule}")
+        if tags:
+            notes.append("已尝试同步标签，若 TickTick 侧未显示则说明该字段当前接口不稳定")
+        if checklist_items:
+            notes.append(f"已附带 {len(checklist_items)} 条清单")
+        return notes
+
+    def _append_notes(self, message: str, notes: Optional[list[str]]) -> str:
+        if not notes:
+            return message
+        return f"{message}；{'；'.join(notes)}"
+
     def _render_update_reply(
         self,
         *,
         title: str,
-        due_at: datetime | None,
+        due_at: Optional[datetime],
         description_changed: bool,
-        moved_list_name: str | None,
+        moved_list_name: Optional[str],
+        notes: Optional[list[str]] = None,
     ) -> str:
         parts: list[str] = []
         if due_at is not None:
@@ -384,4 +505,4 @@ class TaskCommandService:
         if moved_list_name:
             detail_bits.append(f"已移到 {moved_list_name}")
         detail = f"，{'，'.join(detail_bits)}" if detail_bits else ""
-        return f"好，我已经替你改好了：{' '.join(parts)}{detail}"
+        return self._append_notes(f"好，我已经替你改好了：{' '.join(parts)}{detail}", notes)

@@ -13,8 +13,10 @@ from ticktick_telegram_assistant.integrations.ticktick_client import TickTickCli
 from ticktick_telegram_assistant.integrations.telegram_poller import TelegramPoller
 from ticktick_telegram_assistant.integrations.ticktick_oauth_client import TickTickOAuthClient
 from ticktick_telegram_assistant.services.conversation_service import ConversationService
+from ticktick_telegram_assistant.services.memory_service import MemoryService
 from ticktick_telegram_assistant.services.task_command_service import TaskCommandService
 from ticktick_telegram_assistant.services.ticktick_oauth_service import TickTickOAuthService
+from ticktick_telegram_assistant.services.timezone_resolver import TimezoneResolver
 from ticktick_telegram_assistant.services.today_brief_service import TodayBriefService
 from ticktick_telegram_assistant.workers.reminder_worker import ReminderWorker
 
@@ -87,6 +89,7 @@ def build_local_runner(settings: Settings | None = None) -> LocalAssistantRunner
             token_url=app_settings.ticktick_token_url,
         ),
     )
+    memory_service = MemoryService(session_factory=session_factory)
     planner = OpenAIPlanner(client=AsyncOpenAI(api_key=app_settings.openai_api_key) if app_settings.openai_api_key else None)
     conversation_service = ConversationService(
         planner=planner,
@@ -99,6 +102,10 @@ def build_local_runner(settings: Settings | None = None) -> LocalAssistantRunner
             session_factory=session_factory,
             ticktick_client=ticktick_client,
         ),
+        session_factory=session_factory,
+        timezone_resolver=TimezoneResolver(),
+        memory_service=memory_service,
+        ticktick_client=ticktick_client,
     )
     poller = TelegramPoller(
         telegram_client=telegram_client,
