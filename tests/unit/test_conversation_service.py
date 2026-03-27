@@ -224,6 +224,35 @@ async def test_handle_update_returns_today_brief_when_ticktick_connected() -> No
 
 
 @pytest.mark.asyncio
+async def test_handle_update_recognizes_today_todo_question_as_today_brief() -> None:
+    planner = FakePlanner(PlannedConversation())
+    oauth_service = FakeTickTickOAuthService(connected=True, auth_url=None)
+    today_brief_service = FakeTodayBriefService("今天重点：\n- 先做 A")
+    service = ConversationService(
+        planner=planner,
+        ticktick_oauth_service=oauth_service,
+        today_brief_service=today_brief_service,
+    )
+    update = TelegramUpdate.model_validate(
+        {
+            "update_id": 4_1,
+            "message": {
+                "message_id": 10_1,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "我今天要做什么",
+            },
+        }
+    )
+
+    replies = await service.handle_update(update)
+
+    assert [reply.text for reply in replies] == ["今天重点：\n- 先做 A"]
+    assert planner.contexts == []
+    assert len(today_brief_service.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_handle_update_executes_create_action_when_ticktick_connected() -> None:
     planner = FakePlanner(
         PlannedConversation(
@@ -304,6 +333,115 @@ async def test_handle_update_executes_complete_action_when_ticktick_connected() 
     assert [reply.text for reply in replies] == ["好，这条我帮你勾完成了：给导师发邮件"]
     assert len(task_command_service.calls) == 1
     assert task_command_service.calls[0]["action"].action_type == "complete_task"
+
+
+@pytest.mark.asyncio
+async def test_handle_update_yes_reply_uses_saved_today_brief_confirmation() -> None:
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        user = User(
+            telegram_user_id="99",
+            display_name="Jiaxin",
+            current_timezone="America/Los_Angeles",
+            ticktick_access_token="access-token",
+        )
+        session.add(user)
+        session.flush()
+        user_id = user.id
+        session.commit()
+
+    memory_service = MemoryService(session_factory=session_factory)
+    memory_service.replace_active_context(
+        user_id=user_id,
+        context_type="pending_query",
+        payload_json={"kind": "today_brief"},
+    )
+    today_brief_service = FakeTodayBriefService("今天重点：\n- 先做 A")
+    oauth_service = FakeTickTickOAuthService(connected=True, auth_url=None)
+    service = ConversationService(
+        ticktick_oauth_service=oauth_service,
+        today_brief_service=today_brief_service,
+        session_factory=session_factory,
+        memory_service=memory_service,
+    )
+    update = TelegramUpdate.model_validate(
+        {
+            "update_id": 6_1,
+            "message": {
+                "message_id": 12_1,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "对",
+            },
+        }
+    )
+
+    replies = await service.handle_update(update)
+
+    assert [reply.text for reply in replies] == ["今天重点：\n- 先做 A"]
+    assert memory_service.get_active_context(user_id=user_id, context_type="pending_query") is None
+
+
+@pytest.mark.asyncio
+async def test_handle_update_saves_today_brief_query_prompt_for_follow_up_yes() -> None:
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        user = User(
+            telegram_user_id="99",
+            display_name="Jiaxin",
+            current_timezone="America/Los_Angeles",
+            ticktick_access_token="access-token",
+        )
+        session.add(user)
+        session.flush()
+        user_id = user.id
+        session.commit()
+
+    planner = FakePlanner(
+        [
+            PlannedConversation(assistant_reply="要我帮你列出 TickTick 中今天的任务吗？"),
+            PlannedConversation(),
+        ]
+    )
+    memory_service = MemoryService(session_factory=session_factory)
+    today_brief_service = FakeTodayBriefService("今天重点：\n- 先做 A")
+    oauth_service = FakeTickTickOAuthService(connected=True, auth_url=None)
+    service = ConversationService(
+        planner=planner,
+        ticktick_oauth_service=oauth_service,
+        today_brief_service=today_brief_service,
+        session_factory=session_factory,
+        memory_service=memory_service,
+    )
+    first_update = TelegramUpdate.model_validate(
+        {
+            "update_id": 6_2,
+            "message": {
+                "message_id": 12_2,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "帮我看一下",
+            },
+        }
+    )
+    second_update = TelegramUpdate.model_validate(
+        {
+            "update_id": 6_3,
+            "message": {
+                "message_id": 12_3,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "对",
+            },
+        }
+    )
+
+    first_replies = await service.handle_update(first_update)
+    second_replies = await service.handle_update(second_update)
+
+    assert [reply.text for reply in first_replies] == ["要我帮你列出 TickTick 中今天的任务吗？"]
+    assert [reply.text for reply in second_replies] == ["今天重点：\n- 先做 A"]
+    assert memory_service.get_active_context(user_id=user_id, context_type="pending_query") is None
 
 
 @pytest.mark.asyncio

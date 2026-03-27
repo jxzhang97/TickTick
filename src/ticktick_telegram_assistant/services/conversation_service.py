@@ -100,6 +100,9 @@ class ConversationService:
         confirmation_reply = await self._maybe_handle_pending_confirmation(update)
         if confirmation_reply is not None:
             return [confirmation_reply]
+        query_reply = await self._maybe_handle_pending_query(update)
+        if query_reply is not None:
+            return [query_reply]
         batch_replies = await self._maybe_handle_multiline_batch(update)
         if batch_replies is not None:
             return batch_replies
@@ -133,6 +136,10 @@ class ConversationService:
         if action_reply is not None:
             return [action_reply]
         reply_text = planned.assistant_reply or self._fallback_reply(update.message.text)
+        self._maybe_save_pending_query(
+            telegram_user_id=telegram_user_id,
+            reply_text=reply_text,
+        )
         return [TelegramReply(chat_id=update.message.chat.id, text=reply_text)]
 
     async def update_user_timezone(self, *, user_id: int, timezone_name: str, source: str) -> None:
@@ -284,6 +291,8 @@ class ConversationService:
         )
 
     def _looks_like_ticktick_request(self, text: str) -> bool:
+        if self._looks_like_today_brief_request(text):
+            return True
         keywords = (
             "安排",
             "日程",
@@ -315,7 +324,16 @@ class ConversationService:
 
     def _looks_like_today_brief_request(self, text: str) -> bool:
         lowered = text.lower()
-        return "今天" in text and any(keyword in text or keyword in lowered for keyword in ("安排", "日程", "ddl", "deadline"))
+        if "今天" not in text and "今日" not in text:
+            return False
+        if any(keyword in text or keyword in lowered for keyword in ("安排", "日程", "ddl", "deadline")):
+            return True
+        return bool(
+            re.search(
+                r"(今天|今日).*(要做什么|做什么|干什么|该做什么|有什么事|有哪些事|有什么要做)",
+                text,
+            )
+        )
 
     def _current_timezone_for_update(self, update: TelegramUpdate) -> str:
         if update.message is None or update.message.from_ is None:
@@ -739,6 +757,33 @@ class ConversationService:
             text="我先停在这一步。你可以回我“合并”“继续新建”“改时间”或者“取消”。",
         )
 
+    async def _maybe_handle_pending_query(self, update: TelegramUpdate) -> TelegramReply | None:
+        if update.message is None or update.message.text is None:
+            return None
+        telegram_user_id = self._telegram_user_id(update)
+        if telegram_user_id is None:
+            return None
+        context = self._load_pending_query_context(telegram_user_id=telegram_user_id)
+        if context is None:
+            return None
+
+        text = update.message.text.strip()
+        lowered = text.casefold()
+        if any(token in text for token in ("取消", "算了", "不用了", "不要了")):
+            self._clear_pending_query(telegram_user_id=telegram_user_id)
+            return TelegramReply(chat_id=update.message.chat.id, text="好，我先不继续这条。")
+
+        if context.get("kind") == "today_brief" and any(
+            token in lowered for token in ("对", "是", "好", "好的", "行", "可以", "嗯")
+        ):
+            self._clear_pending_query(telegram_user_id=telegram_user_id)
+            return await self._build_connected_today_brief_reply(
+                chat_id=update.message.chat.id,
+                telegram_user_id=telegram_user_id,
+            )
+
+        return None
+
     async def _maybe_request_write_confirmation(self, *, telegram_user_id: str, action: PlannedAction) -> str | None:
         if self._session_factory is None or self._ticktick_client is None:
             return None
@@ -876,6 +921,78 @@ class ConversationService:
         if user is None:
             return
         self._memory_service.clear_active_context(user_id=user.id, context_type="pending_confirmation")
+
+    def _maybe_save_pending_query(self, *, telegram_user_id: str | None, reply_text: str) -> None:
+        if telegram_user_id is None:
+            return
+        if self._looks_like_today_brief_prompt(reply_text):
+            self._save_pending_query(
+                telegram_user_id=telegram_user_id,
+                payload={"kind": "today_brief"},
+            )
+
+    def _looks_like_today_brief_prompt(self, text: str) -> bool:
+        lowered = text.casefold()
+        return ("今天" in text or "今日" in text) and any(
+            token in text or token in lowered
+            for token in ("任务吗", "安排吗", "日程吗", "列出", "看看", "要我帮你", "帮你列")
+        )
+
+    def _save_pending_query(self, *, telegram_user_id: str, payload: dict) -> None:
+        if self._memory_service is None:
+            return
+        user = self._get_user_by_telegram_user_id(telegram_user_id)
+        if user is None:
+            return
+        self._memory_service.replace_active_context(
+            user_id=user.id,
+            context_type="pending_query",
+            payload_json=payload,
+        )
+
+    def _load_pending_query_context(self, *, telegram_user_id: str) -> dict | None:
+        if self._memory_service is None:
+            return None
+        user = self._get_user_by_telegram_user_id(telegram_user_id)
+        if user is None:
+            return None
+        context = self._memory_service.get_active_context(user_id=user.id, context_type="pending_query")
+        return None if context is None else dict(context.payload_json or {})
+
+    def _clear_pending_query(self, *, telegram_user_id: str) -> None:
+        if self._memory_service is None:
+            return
+        user = self._get_user_by_telegram_user_id(telegram_user_id)
+        if user is None:
+            return
+        self._memory_service.clear_active_context(user_id=user.id, context_type="pending_query")
+
+    async def _build_connected_today_brief_reply(
+        self,
+        *,
+        chat_id: int,
+        telegram_user_id: str,
+    ) -> TelegramReply:
+        if self._ticktick_oauth_service is not None:
+            connected = await self._ticktick_oauth_service.has_connection(
+                telegram_user_id=telegram_user_id
+            )
+            if not connected:
+                return await self._build_ticktick_auth_reply(
+                    chat_id=chat_id,
+                    telegram_user_id=telegram_user_id,
+                )
+        if self._today_brief_service is None:
+            return TelegramReply(
+                chat_id=chat_id,
+                text="我知道你是在问今天要做什么，但今天简报这条链路现在还没完全接好。",
+            )
+        return TelegramReply(
+            chat_id=chat_id,
+            text=await self._today_brief_service.build_today_brief(
+                telegram_user_id=telegram_user_id,
+            ),
+        )
 
     def _find_duplicate_task(self, *, tasks: list, title: str | None, exclude_task_id: str | None) -> object | None:
         if not title:
