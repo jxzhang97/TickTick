@@ -5,7 +5,7 @@ import asyncio
 from ticktick_telegram_assistant.config import Settings
 from ticktick_telegram_assistant.integrations.telegram_client import TelegramClient
 from ticktick_telegram_assistant.integrations.telegram_poller import TelegramPoller
-from ticktick_telegram_assistant.services.conversation_service import NoopConversationService
+from ticktick_telegram_assistant.services.conversation_service import ConversationService
 from ticktick_telegram_assistant.workers.reminder_worker import ReminderWorker
 
 
@@ -42,7 +42,7 @@ class LocalAssistantRunner:
 def build_local_runner(settings: Settings | None = None) -> LocalAssistantRunner:
     app_settings = settings or Settings()
     telegram_client = TelegramClient(token=app_settings.telegram_bot_token)
-    conversation_service = NoopConversationService()
+    conversation_service = ConversationService()
     poller = TelegramPoller(
         telegram_client=telegram_client,
         conversation_service=conversation_service,

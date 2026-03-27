@@ -27,6 +27,16 @@ class TelegramClient:
         )
         return payload.get("result", [])
 
+    async def send_message(self, *, chat_id: int, text: str) -> dict:
+        payload = await self._post(
+            "sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": text,
+            },
+        )
+        return payload
+
     async def _post(self, method: str, *, json: dict) -> dict:
         if self._http_client is not None:
             response = await self._http_client.post(f"{self._base_url}/{method}", json=json)

@@ -30,6 +30,7 @@ class ConversationContext(BaseModel):
 class PlannedConversation(BaseModel):
     actions: list["PlannedAction"] = Field(default_factory=list)
     requires_confirmation: bool = False
+    assistant_reply: str | None = None
 
 
 class PlannedAction(BaseModel):
@@ -56,3 +57,8 @@ class BriefingSection(BaseModel):
 class EveningReviewReply(BaseModel):
     completed_indices: list[int] = Field(default_factory=list)
     rescheduled_indices: list[int] = Field(default_factory=list)
+
+
+class TelegramReply(BaseModel):
+    chat_id: int
+    text: str

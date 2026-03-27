@@ -29,6 +29,8 @@ class TelegramPoller:
         next_offset = offset
         for raw_update in raw_updates:
             update = TelegramUpdate.model_validate(raw_update)
-            await self._conversation_service.handle_update(update)
+            replies = await self._conversation_service.handle_update(update)
+            for reply in replies:
+                await self._telegram_client.send_message(chat_id=reply.chat_id, text=reply.text)
             next_offset = update.update_id + 1
         return next_offset

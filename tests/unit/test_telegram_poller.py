@@ -1,5 +1,6 @@
 import pytest
 
+from ticktick_telegram_assistant.domain.schemas import TelegramReply
 from ticktick_telegram_assistant.services.conversation_service import TelegramUpdate
 
 
@@ -7,18 +8,24 @@ class FakeTelegramClient:
     def __init__(self, updates: list[dict]) -> None:
         self._updates = updates
         self.calls: list[dict] = []
+        self.sent_messages: list[dict] = []
 
     async def get_updates(self, *, offset: int | None, timeout: int) -> list[dict]:
         self.calls.append({"offset": offset, "timeout": timeout})
         return self._updates
+
+    async def send_message(self, *, chat_id: int, text: str) -> dict:
+        self.sent_messages.append({"chat_id": chat_id, "text": text})
+        return {"ok": True}
 
 
 class FakeConversationService:
     def __init__(self) -> None:
         self.handled: list[TelegramUpdate] = []
 
-    async def handle_update(self, update: TelegramUpdate) -> None:
+    async def handle_update(self, update: TelegramUpdate) -> list[TelegramReply]:
         self.handled.append(update)
+        return [TelegramReply(chat_id=update.message.chat.id, text="收到，我记下了。")]
 
 
 @pytest.mark.asyncio
@@ -44,4 +51,5 @@ async def test_poll_once_processes_updates_and_returns_next_offset() -> None:
 
     assert client.calls == [{"offset": 100, "timeout": 30}]
     assert [update.update_id for update in service.handled] == [101]
+    assert client.sent_messages == [{"chat_id": 99, "text": "收到，我记下了。"}]
     assert next_offset == 102
