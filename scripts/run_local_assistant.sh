@@ -14,6 +14,10 @@ if [[ -z "$DATABASE_URL_VALUE" ]] && [[ -f .env ]]; then
   DATABASE_URL_VALUE="$(grep '^DATABASE_URL=' .env | tail -1 | cut -d= -f2-)"
 fi
 
+if [[ -n "$DATABASE_URL_VALUE" ]]; then
+  export DATABASE_URL="$DATABASE_URL_VALUE"
+fi
+
 if [[ "$DATABASE_URL_VALUE" == postgresql* ]]; then
   if command -v docker >/dev/null 2>&1; then
     docker compose up -d postgres
