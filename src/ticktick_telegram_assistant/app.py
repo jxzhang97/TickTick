@@ -6,10 +6,12 @@ from ticktick_telegram_assistant.api.telegram_webhook import router as telegram_
 from ticktick_telegram_assistant.config import Settings
 from ticktick_telegram_assistant.db.session import create_session_factory
 from ticktick_telegram_assistant.integrations.telegram_client import TelegramClient
+from ticktick_telegram_assistant.integrations.ticktick_client import TickTickClient
 from ticktick_telegram_assistant.integrations.ticktick_oauth_client import TickTickOAuthClient
 from ticktick_telegram_assistant.logging import configure_logging
 from ticktick_telegram_assistant.services.conversation_service import ConversationService
 from ticktick_telegram_assistant.services.ticktick_oauth_service import TickTickOAuthService
+from ticktick_telegram_assistant.services.today_brief_service import TodayBriefService
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -19,6 +21,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = app_settings
     app.state.session_factory = create_session_factory(app_settings)
     app.state.telegram_client = TelegramClient(token=app_settings.telegram_bot_token)
+    app.state.ticktick_client = TickTickClient(base_url=app_settings.ticktick_base_url)
     app.state.ticktick_oauth_service = TickTickOAuthService(
         settings=app_settings,
         session_factory=app.state.session_factory,
@@ -30,6 +33,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.conversation_service = ConversationService(
         ticktick_oauth_service=app.state.ticktick_oauth_service,
+        today_brief_service=TodayBriefService(
+            session_factory=app.state.session_factory,
+            ticktick_client=app.state.ticktick_client,
+        ),
     )
     app.include_router(health_router)
     app.include_router(ticktick_oauth_router)

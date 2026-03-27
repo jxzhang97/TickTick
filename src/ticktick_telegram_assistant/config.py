@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""
     telegram_poll_timeout_seconds: int = 30
     openai_api_key: str = ""
-    ticktick_base_url: str = "https://developer.ticktick.com"
+    ticktick_base_url: str = "https://api.ticktick.com"
     ticktick_authorize_url: str = "https://ticktick.com/oauth/authorize"
     ticktick_token_url: str = "https://ticktick.com/oauth/token"
     ticktick_scope: str = ""

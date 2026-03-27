@@ -37,11 +37,13 @@ class ConversationService:
         planner: OpenAIPlanner | None = None,
         evening_review_service: EveningReviewService | None = None,
         ticktick_oauth_service=None,
+        today_brief_service=None,
     ) -> None:
         self._context_builder = context_builder or ContextBuilder()
         self._planner = planner or OpenAIPlanner()
         self._evening_review_service = evening_review_service or EveningReviewService()
         self._ticktick_oauth_service = ticktick_oauth_service
+        self._today_brief_service = today_brief_service
         self._user_timezones: dict[int, dict[str, str]] = {}
 
     async def handle_update(self, update: TelegramUpdate) -> list[TelegramReply]:
@@ -52,7 +54,7 @@ class ConversationService:
                 chat_id=update.message.chat.id,
                 text=update.message.text,
             )
-        ticktick_reply = await self._maybe_build_ticktick_connection_reply(update)
+        ticktick_reply = await self._maybe_build_ticktick_reply(update)
         if ticktick_reply is not None:
             return [ticktick_reply]
         context = self._context_builder.build(update.message.text)
@@ -86,7 +88,7 @@ class ConversationService:
             return "我在，基础服务已经起来了。下一步是把 TickTick 授权和真实读写链路接上，这样我才能真的替你查和改任务。"
         return "我收到你的话了。现在 Telegram 收发已经打通，但 TickTick 的真实执行链路还在补，所以我先不瞎写入。"
 
-    async def _maybe_build_ticktick_connection_reply(
+    async def _maybe_build_ticktick_reply(
         self,
         update: TelegramUpdate,
     ) -> TelegramReply | None:
@@ -98,7 +100,15 @@ class ConversationService:
         telegram_user_id = self._telegram_user_id(update)
         if telegram_user_id is None:
             return None
-        if await self._ticktick_oauth_service.has_connection(telegram_user_id=telegram_user_id):
+        connected = await self._ticktick_oauth_service.has_connection(telegram_user_id=telegram_user_id)
+        if connected:
+            if self._today_brief_service is not None and self._looks_like_today_brief_request(update.message.text):
+                return TelegramReply(
+                    chat_id=update.message.chat.id,
+                    text=await self._today_brief_service.build_today_brief(
+                        telegram_user_id=telegram_user_id,
+                    ),
+                )
             return None
 
         auth_url = await self._ticktick_oauth_service.create_authorization_url(
@@ -144,6 +154,10 @@ class ConversationService:
         if update.message.from_ is not None:
             return str(update.message.from_.id)
         return str(update.message.chat.id)
+
+    def _looks_like_today_brief_request(self, text: str) -> bool:
+        lowered = text.lower()
+        return "今天" in text and any(keyword in text or keyword in lowered for keyword in ("安排", "日程", "ddl", "deadline"))
 
 
 class NoopConversationService(ConversationService):
