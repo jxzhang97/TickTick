@@ -15,7 +15,9 @@ def test_deployment_docs_cover_env_and_local_postgres() -> None:
     assert compose.exists()
     assert "docker compose up -d postgres" in readme
     assert "Telegram polling" in readme
+    assert "sqlite:///./assistant.db" in readme
     assert runbook.exists()
+    assert "sqlite:///./assistant.db" in runbook.read_text(encoding="utf-8")
     assert "launchctl" in runbook.read_text(encoding="utf-8")
     assert launchd_plist.exists()
     assert run_script.exists()

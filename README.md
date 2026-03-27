@@ -16,6 +16,12 @@ This branch is configured for local hosting on a long-lived Mac, using Telegram 
 docker compose up -d postgres
 ```
 
+If the host machine does not have Docker, you can use a local SQLite file instead:
+
+```env
+DATABASE_URL=sqlite:///./assistant.db
+```
+
 4. Copy values from `.env.example` into `.env`.
 5. Apply migrations:
 
@@ -56,6 +62,7 @@ Use the helper script:
 
 - Telegram polling is the default receive mode for local hosting.
 - TickTick OAuth callback is exposed locally at `/auth/ticktick/callback`.
+- If Docker is unavailable, set `DATABASE_URL=sqlite:///./assistant.db` and the helper script will skip Postgres startup.
 - For Mac Studio deployment and `launchd` setup, see `docs/runbooks/mac-studio-deploy.md`.
 
 ## Verification

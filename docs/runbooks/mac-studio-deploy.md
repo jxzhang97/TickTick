@@ -17,11 +17,42 @@ cd /Users/jiaxinzhang/doc_unsyn/TickTick_Codex
 python3 -m venv .venv
 .venv/bin/python -m pip install -e '.[dev]'
 cp .env.example .env
-docker compose up -d postgres
 .venv/bin/alembic upgrade head
 ```
 
 Fill `.env` with your real secrets before starting the service.
+
+## Database choice
+
+### Option A: Docker + Postgres
+
+Keep the default:
+
+```env
+DATABASE_URL=postgresql+psycopg://assistant:assistant@localhost:5432/assistant
+```
+
+Then start Postgres with:
+
+```bash
+docker compose up -d postgres
+```
+
+### Option B: Docker-free SQLite fallback
+
+If the machine does not have Docker, change `.env` to:
+
+```env
+DATABASE_URL=sqlite:///./assistant.db
+```
+
+Then run:
+
+```bash
+PYTHONPATH=src .venv/bin/alembic upgrade head
+```
+
+SQLite is acceptable for this single-user local deployment path.
 
 ## Manual start
 
