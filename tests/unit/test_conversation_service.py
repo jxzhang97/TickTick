@@ -8,12 +8,14 @@ from ticktick_telegram_assistant.services.conversation_service import (
 
 
 class FakePlanner:
-    def __init__(self, planned: PlannedConversation) -> None:
+    def __init__(self, planned: PlannedConversation | list[PlannedConversation]) -> None:
         self._planned = planned
         self.contexts = []
 
     async def plan(self, context):
         self.contexts.append(context)
+        if isinstance(self._planned, list):
+            return self._planned.pop(0)
         return self._planned
 
 
@@ -294,3 +296,69 @@ async def test_handle_update_executes_update_action_when_ticktick_connected() ->
     assert [reply.text for reply in replies] == ["好，我已经替你改好了：周六 15:00 weekly sync"]
     assert len(task_command_service.calls) == 1
     assert task_command_service.calls[0]["action"].action_type == "update_task"
+
+
+@pytest.mark.asyncio
+async def test_handle_update_reuses_last_task_context_for_follow_up_edit() -> None:
+    planner = FakePlanner(
+        [
+            PlannedConversation(
+                actions=[
+                    {
+                        "action_type": "create_task",
+                        "payload": {
+                            "title": "给导师发邮件",
+                            "semantic_type": "explicit_time",
+                            "due_at": "2026-03-28T15:00:00-07:00",
+                        },
+                    }
+                ]
+            ),
+            PlannedConversation(
+                actions=[
+                    {
+                        "action_type": "update_task",
+                        "payload": {
+                            "match_title": "给导师发邮件",
+                            "due_at": "2026-03-29T15:00:00-07:00",
+                        },
+                    }
+                ]
+            ),
+        ]
+    )
+    oauth_service = FakeTickTickOAuthService(connected=True, auth_url=None)
+    task_command_service = FakeTaskCommandService()
+    service = ConversationService(
+        planner=planner,
+        ticktick_oauth_service=oauth_service,
+        task_command_service=task_command_service,
+    )
+
+    create_update = TelegramUpdate.model_validate(
+        {
+            "update_id": 8,
+            "message": {
+                "message_id": 14,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "明天下午3点提醒我给导师发邮件",
+            },
+        }
+    )
+    follow_up_update = TelegramUpdate.model_validate(
+        {
+            "update_id": 9,
+            "message": {
+                "message_id": 15,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "改到后天下午3点",
+            },
+        }
+    )
+
+    await service.handle_update(create_update)
+    await service.handle_update(follow_up_update)
+
+    assert planner.contexts[1].user_text == "把 给导师发邮件 改到后天下午3点"

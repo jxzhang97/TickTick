@@ -1,4 +1,5 @@
 from sqlalchemy.orm import Session
+from sqlalchemy import select
 
 from ticktick_telegram_assistant.db.models.user import User
 
@@ -33,3 +34,12 @@ class UserRepository:
             self._session.add(user)
             self._session.flush()
         return user
+
+    def list_connected_users(self) -> list[User]:
+        if self._session is None:
+            return []
+        return list(
+            self._session.scalars(
+                select(User).where(User.ticktick_access_token.is_not(None))
+            )
+        )

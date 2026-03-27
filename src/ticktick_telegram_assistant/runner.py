@@ -83,7 +83,11 @@ def build_local_runner(settings: Settings | None = None) -> LocalAssistantRunner
     return LocalAssistantRunner(
         telegram_client=telegram_client,
         poller=poller,
-        reminder_worker=ReminderWorker(),
+        reminder_worker=ReminderWorker(
+            session_factory=session_factory,
+            ticktick_client=ticktick_client,
+            telegram_client=telegram_client,
+        ),
     )
 
 

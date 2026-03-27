@@ -1,6 +1,6 @@
 from pydantic import BaseModel, ConfigDict, Field
 
-from ticktick_telegram_assistant.domain.schemas import PlannedConversation, TelegramReply
+from ticktick_telegram_assistant.domain.schemas import PlannedAction, PlannedConversation, TelegramReply
 from ticktick_telegram_assistant.integrations.openai_planner import OpenAIPlanner
 from ticktick_telegram_assistant.services.context_builder import ContextBuilder
 from ticktick_telegram_assistant.services.evening_review_service import EveningReviewService
@@ -47,6 +47,7 @@ class ConversationService:
         self._today_brief_service = today_brief_service
         self._task_command_service = task_command_service
         self._user_timezones: dict[int, dict[str, str]] = {}
+        self._active_task_contexts: dict[str, dict[str, str]] = {}
 
     async def handle_update(self, update: TelegramUpdate) -> list[TelegramReply]:
         if update.message is None or update.message.text is None:
@@ -59,12 +60,21 @@ class ConversationService:
         ticktick_reply = await self._maybe_build_ticktick_reply(update)
         if ticktick_reply is not None:
             return [ticktick_reply]
+        telegram_user_id = self._telegram_user_id(update)
+        resolved_text = self._resolve_follow_up_text(
+            telegram_user_id=telegram_user_id,
+            text=update.message.text,
+        )
         context = self._context_builder.build(
-            update.message.text,
+            resolved_text,
             current_timezone=self._current_timezone_for_update(update),
         )
         planned = await self._planner.plan(context)
-        action_reply = await self._maybe_execute_planned_actions(update=update, planned=planned)
+        action_reply = await self._maybe_execute_planned_actions(
+            update=update,
+            planned=planned,
+            telegram_user_id=telegram_user_id,
+        )
         if action_reply is not None:
             return [action_reply]
         reply_text = planned.assistant_reply or self._fallback_reply(update.message.text)
@@ -179,6 +189,7 @@ class ConversationService:
         *,
         update: TelegramUpdate,
         planned: PlannedConversation,
+        telegram_user_id: str | None,
     ) -> TelegramReply | None:
         if (
             self._task_command_service is None
@@ -188,8 +199,6 @@ class ConversationService:
             or not self._looks_like_ticktick_request(update.message.text)
         ):
             return None
-
-        telegram_user_id = self._telegram_user_id(update)
         if telegram_user_id is None:
             return None
 
@@ -198,7 +207,46 @@ class ConversationService:
             telegram_user_id=telegram_user_id,
             action=action,
         )
+        self._store_active_task_context(telegram_user_id=telegram_user_id, action=action)
         return TelegramReply(chat_id=update.message.chat.id, text=reply_text)
+
+    def _resolve_follow_up_text(self, *, telegram_user_id: str | None, text: str) -> str:
+        if telegram_user_id is None:
+            return text
+        context = self._active_task_contexts.get(telegram_user_id)
+        if context is None:
+            return text
+        title = context.get("title")
+        if not title:
+            return text
+
+        stripped = text.strip()
+        if self._has_explicit_task_reference(stripped):
+            return stripped
+        if stripped.startswith(("改到", "改成", "挪到", "推到", "提前", "延后", "放到")):
+            return f"把 {title} {stripped}"
+        if stripped.startswith(("再补一句", "补一句", "补充", "加一句")):
+            return f"给 {title} {stripped}"
+        if stripped.startswith(("做完了", "完成了", "勾掉", "勾选完成")):
+            return f"{title}{stripped}"
+        return stripped
+
+    def _store_active_task_context(self, *, telegram_user_id: str, action: PlannedAction) -> None:
+        title = None
+        if action.action_type == "create_task":
+            title = action.payload.get("title")
+        elif action.action_type == "update_task":
+            title = action.payload.get("title") or action.payload.get("match_title")
+        elif action.action_type == "complete_task":
+            title = action.payload.get("title")
+        if not title:
+            return
+        self._active_task_contexts[telegram_user_id] = {"title": str(title).strip()}
+
+    def _has_explicit_task_reference(self, text: str) -> bool:
+        if any(marker in text for marker in ("那个", "这条", "前", "第", "最后")):
+            return True
+        return " " in text or len(text) > 12
 
 
 class NoopConversationService(ConversationService):
