@@ -7,13 +7,13 @@ This runbook documents the zero-cost local deployment flow for the TickTick Tele
 Clone or sync the repository into:
 
 ```bash
-/Users/jiaxinzhang/doc_unsyn/TickTick_Codex
+/Users/jiaxin/doc_unsyn/TickTick_Codex
 ```
 
 ## First-time setup
 
 ```bash
-cd /Users/jiaxinzhang/doc_unsyn/TickTick_Codex
+cd /Users/jiaxin/doc_unsyn/TickTick_Codex
 python3 -m venv .venv
 .venv/bin/python -m pip install -e '.[dev]'
 cp .env.example .env
@@ -57,7 +57,7 @@ SQLite is acceptable for this single-user local deployment path.
 ## Manual start
 
 ```bash
-cd /Users/jiaxinzhang/doc_unsyn/TickTick_Codex
+cd /Users/jiaxin/doc_unsyn/TickTick_Codex
 ./scripts/run_local_assistant.sh
 ```
 

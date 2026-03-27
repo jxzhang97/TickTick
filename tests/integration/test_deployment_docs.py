@@ -19,5 +19,7 @@ def test_deployment_docs_cover_env_and_local_postgres() -> None:
     assert runbook.exists()
     assert "sqlite:///./assistant.db" in runbook.read_text(encoding="utf-8")
     assert "launchctl" in runbook.read_text(encoding="utf-8")
+    assert "/Users/jiaxin/doc_unsyn/TickTick_Codex" in runbook.read_text(encoding="utf-8")
     assert launchd_plist.exists()
+    assert "/Users/jiaxin/doc_unsyn/TickTick_Codex" in launchd_plist.read_text(encoding="utf-8")
     assert run_script.exists()

@@ -38,12 +38,14 @@ class ConversationService:
         evening_review_service: EveningReviewService | None = None,
         ticktick_oauth_service=None,
         today_brief_service=None,
+        task_command_service=None,
     ) -> None:
         self._context_builder = context_builder or ContextBuilder()
         self._planner = planner or OpenAIPlanner()
         self._evening_review_service = evening_review_service or EveningReviewService()
         self._ticktick_oauth_service = ticktick_oauth_service
         self._today_brief_service = today_brief_service
+        self._task_command_service = task_command_service
         self._user_timezones: dict[int, dict[str, str]] = {}
 
     async def handle_update(self, update: TelegramUpdate) -> list[TelegramReply]:
@@ -57,8 +59,14 @@ class ConversationService:
         ticktick_reply = await self._maybe_build_ticktick_reply(update)
         if ticktick_reply is not None:
             return [ticktick_reply]
-        context = self._context_builder.build(update.message.text)
+        context = self._context_builder.build(
+            update.message.text,
+            current_timezone=self._current_timezone_for_update(update),
+        )
         planned = await self._planner.plan(context)
+        action_reply = await self._maybe_execute_planned_actions(update=update, planned=planned)
+        if action_reply is not None:
+            return [action_reply]
         reply_text = planned.assistant_reply or self._fallback_reply(update.message.text)
         return [TelegramReply(chat_id=update.message.chat.id, text=reply_text)]
 
@@ -66,7 +74,9 @@ class ConversationService:
         self._user_timezones[user_id] = {"timezone_name": timezone_name, "source": source}
 
     def _is_evening_review_reply(self, text: str) -> bool:
-        return "做完" in text or "改到" in text
+        action_tokens = ("做完", "完成", "改到", "改成")
+        reference_tokens = ("前", "第", "最后", "那个", "这条", "这些", "这几个")
+        return any(token in text for token in action_tokens) and any(token in text for token in reference_tokens)
 
     async def _handle_evening_review_reply(self, *, chat_id: int, text: str) -> list[TelegramReply]:
         parsed = self._evening_review_service.parse_reply(reply_text=text, candidate_titles=[])
@@ -158,6 +168,37 @@ class ConversationService:
     def _looks_like_today_brief_request(self, text: str) -> bool:
         lowered = text.lower()
         return "今天" in text and any(keyword in text or keyword in lowered for keyword in ("安排", "日程", "ddl", "deadline"))
+
+    def _current_timezone_for_update(self, update: TelegramUpdate) -> str:
+        if update.message is None or update.message.from_ is None:
+            return "America/Los_Angeles"
+        return self._user_timezones.get(update.message.from_.id, {}).get("timezone_name", "America/Los_Angeles")
+
+    async def _maybe_execute_planned_actions(
+        self,
+        *,
+        update: TelegramUpdate,
+        planned: PlannedConversation,
+    ) -> TelegramReply | None:
+        if (
+            self._task_command_service is None
+            or update.message is None
+            or update.message.text is None
+            or not planned.actions
+            or not self._looks_like_ticktick_request(update.message.text)
+        ):
+            return None
+
+        telegram_user_id = self._telegram_user_id(update)
+        if telegram_user_id is None:
+            return None
+
+        action = planned.actions[0]
+        reply_text = await self._task_command_service.execute_action(
+            telegram_user_id=telegram_user_id,
+            action=action,
+        )
+        return TelegramReply(chat_id=update.message.chat.id, text=reply_text)
 
 
 class NoopConversationService(ConversationService):

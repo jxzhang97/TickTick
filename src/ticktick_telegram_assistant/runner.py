@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import asyncio
 
+from openai import AsyncOpenAI
+
 from ticktick_telegram_assistant.config import Settings
 from ticktick_telegram_assistant.db.session import create_session_factory
 from ticktick_telegram_assistant.integrations.telegram_client import TelegramClient
+from ticktick_telegram_assistant.integrations.openai_planner import OpenAIPlanner
 from ticktick_telegram_assistant.integrations.ticktick_client import TickTickClient
 from ticktick_telegram_assistant.integrations.telegram_poller import TelegramPoller
 from ticktick_telegram_assistant.integrations.ticktick_oauth_client import TickTickOAuthClient
 from ticktick_telegram_assistant.services.conversation_service import ConversationService
+from ticktick_telegram_assistant.services.task_command_service import TaskCommandService
 from ticktick_telegram_assistant.services.ticktick_oauth_service import TickTickOAuthService
 from ticktick_telegram_assistant.services.today_brief_service import TodayBriefService
 from ticktick_telegram_assistant.workers.reminder_worker import ReminderWorker
@@ -58,9 +62,15 @@ def build_local_runner(settings: Settings | None = None) -> LocalAssistantRunner
             token_url=app_settings.ticktick_token_url,
         ),
     )
+    planner = OpenAIPlanner(client=AsyncOpenAI(api_key=app_settings.openai_api_key) if app_settings.openai_api_key else None)
     conversation_service = ConversationService(
+        planner=planner,
         ticktick_oauth_service=ticktick_oauth_service,
         today_brief_service=TodayBriefService(
+            session_factory=session_factory,
+            ticktick_client=ticktick_client,
+        ),
+        task_command_service=TaskCommandService(
             session_factory=session_factory,
             ticktick_client=ticktick_client,
         ),

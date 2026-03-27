@@ -6,12 +6,12 @@
   <string>com.jxzhang.ticktick-assistant</string>
 
   <key>WorkingDirectory</key>
-  <string>/Users/jiaxinzhang/doc_unsyn/TickTick_Codex</string>
+  <string>/Users/jiaxin/doc_unsyn/TickTick_Codex</string>
 
   <key>ProgramArguments</key>
   <array>
     <string>/bin/zsh</string>
-    <string>/Users/jiaxinzhang/doc_unsyn/TickTick_Codex/scripts/run_local_assistant.sh</string>
+    <string>/Users/jiaxin/doc_unsyn/TickTick_Codex/scripts/run_local_assistant.sh</string>
   </array>
 
   <key>RunAtLoad</key>
@@ -21,9 +21,9 @@
   <true/>
 
   <key>StandardOutPath</key>
-  <string>/Users/jiaxinzhang/doc_unsyn/TickTick_Codex/logs/launchd.stdout.log</string>
+  <string>/Users/jiaxin/doc_unsyn/TickTick_Codex/logs/launchd.stdout.log</string>
 
   <key>StandardErrorPath</key>
-  <string>/Users/jiaxinzhang/doc_unsyn/TickTick_Codex/logs/launchd.stderr.log</string>
+  <string>/Users/jiaxin/doc_unsyn/TickTick_Codex/logs/launchd.stderr.log</string>
 </dict>
 </plist>
