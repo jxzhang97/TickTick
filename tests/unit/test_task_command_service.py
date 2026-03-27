@@ -99,21 +99,23 @@ async def test_execute_action_creates_explicit_time_task_and_shadow() -> None:
     client = FakeTickTickClient()
     service = TaskCommandService(session_factory=session_factory, ticktick_client=client)
 
+    action = PlannedAction(
+        action_type="create_task",
+        payload={
+            "title": "给导师发邮件",
+            "description": "补实验结果",
+            "semantic_type": "explicit_time",
+            "due_at": "2026-03-28T15:00:00-07:00",
+        },
+    )
     reply = await service.execute_action(
         telegram_user_id="99",
-        action=PlannedAction(
-            action_type="create_task",
-            payload={
-                "title": "给导师发邮件",
-                "description": "补实验结果",
-                "semantic_type": "explicit_time",
-                "due_at": "2026-03-28T15:00:00-07:00",
-            },
-        ),
+        action=action,
     )
 
     assert "给导师发邮件" in reply
     assert "15:00" in reply
+    assert action.target_task_id == "task-1"
     assert client.calls == [
         {"method": "list_projects", "access_token": "access-token"},
         {
@@ -373,3 +375,55 @@ async def test_execute_action_asks_for_confirmation_when_multiple_tasks_match_up
     assert "不止一条" in reply
     assert "weekly sync" in reply
     assert client.calls == [{"method": "list_tasks", "access_token": "access-token", "since": None}]
+
+
+@pytest.mark.asyncio
+async def test_execute_action_updates_target_task_id_without_ambiguity() -> None:
+    from ticktick_telegram_assistant.services.task_command_service import TaskCommandService
+
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        session.add(
+            User(
+                telegram_user_id="99",
+                display_name="Jiaxin",
+                current_timezone="America/Los_Angeles",
+                ticktick_access_token="access-token",
+            )
+        )
+        session.commit()
+
+    client = FakeTickTickClient()
+    client.tasks = [
+        TickTickTask(id="task-1", projectId="telegram-inbox", title="给导师A发邮件", status=0),
+        TickTickTask(id="task-2", projectId="fun", title="给导师A发邮件", status=0),
+    ]
+    service = TaskCommandService(session_factory=session_factory, ticktick_client=client)
+
+    reply = await service.execute_action(
+        telegram_user_id="99",
+        action=PlannedAction(
+            action_type="update_task",
+            target_task_id="task-2",
+            payload={
+                "match_title": "给导师A发邮件",
+                "description": "记得带附件",
+                "description_mode": "append",
+            },
+        ),
+    )
+
+    assert "给导师A发邮件" in reply
+    assert client.calls == [
+        {"method": "list_tasks", "access_token": "access-token", "since": None},
+        {
+            "method": "update_task",
+            "access_token": "access-token",
+            "task_id": "task-2",
+            "patch": {
+                "id": "task-2",
+                "projectId": "fun",
+                "desc": "记得带附件",
+            },
+        },
+    ]

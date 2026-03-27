@@ -51,11 +51,18 @@ class FakeTodayBriefService:
 
 
 class FakeTaskCommandService:
-    def __init__(self, reply_text: str = "好，我已经替你记进 TickTick 了。") -> None:
+    def __init__(
+        self,
+        reply_text: str = "好，我已经替你记进 TickTick 了。",
+        created_task_id: str | None = None,
+    ) -> None:
         self.reply_text = reply_text
+        self.created_task_id = created_task_id
         self.calls: list[dict] = []
 
     async def execute_action(self, *, telegram_user_id: str, action, now=None) -> str:
+        if action.action_type == "create_task" and self.created_task_id:
+            action.target_task_id = self.created_task_id
         self.calls.append({"telegram_user_id": telegram_user_id, "action": action, "now": now})
         return self.reply_text
 
@@ -417,7 +424,7 @@ async def test_handle_update_processes_multiline_batch_sequentially() -> None:
         ]
     )
     oauth_service = FakeTickTickOAuthService(connected=True, auth_url=None)
-    task_command_service = FakeTaskCommandService()
+    task_command_service = FakeTaskCommandService(created_task_id="task-created-1")
     task_command_service.reply_text = "ok"
     service = ConversationService(
         planner=planner,
@@ -444,6 +451,12 @@ async def test_handle_update_processes_multiline_batch_sequentially() -> None:
         "任务“给导师发邮件”改到后天下午3点",
         "任务“给导师发邮件”再补一句说明：记得带附件",
         "任务“给导师发邮件”放到 fun 那个 list",
+    ]
+    assert [call["action"].target_task_id for call in task_command_service.calls] == [
+        "task-created-1",
+        "task-created-1",
+        "task-created-1",
+        "task-created-1",
     ]
 
 

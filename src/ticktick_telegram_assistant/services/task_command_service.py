@@ -83,6 +83,7 @@ class TaskCommandService:
             timeZone=timezone_name if (due_at or start_at) else None,
         )
         created = await self._ticktick_client.create_task(access_token=access_token, task=create_payload)
+        action.target_task_id = created.id
 
         with self._session_factory() as session:
             TaskShadowRepository(session).add(
@@ -188,6 +189,7 @@ class TaskCommandService:
             project_id=match_or_reply.projectId,
             task_id=match_or_reply.id,
         )
+        action.target_task_id = match_or_reply.id
         return f"好，这条我帮你勾完成了：{match_or_reply.title}"
 
     async def _update_task(self, *, telegram_user_id: str, action: PlannedAction) -> str:
@@ -261,6 +263,7 @@ class TaskCommandService:
             task_id=target_task.id,
             patch=patch,
         )
+        action.target_task_id = target_task.id
 
         with self._session_factory() as session:
             shadow = (

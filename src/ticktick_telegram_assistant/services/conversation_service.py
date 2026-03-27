@@ -212,6 +212,7 @@ class ConversationService:
             return None
 
         action = planned.actions[0]
+        self._apply_active_task_context(telegram_user_id=telegram_user_id, action=action)
         reply_text = await self._task_command_service.execute_action(
             telegram_user_id=telegram_user_id,
             action=action,
@@ -290,7 +291,27 @@ class ConversationService:
             title = action.payload.get("title")
         if not title:
             return
-        self._active_task_contexts[telegram_user_id] = {"title": str(title).strip()}
+        self._active_task_contexts[telegram_user_id] = {
+            "title": str(title).strip(),
+            "task_id": action.target_task_id or "",
+        }
+
+    def _apply_active_task_context(self, *, telegram_user_id: str, action: PlannedAction) -> None:
+        if action.target_task_id:
+            return
+        context = self._active_task_contexts.get(telegram_user_id)
+        if context is None:
+            return
+        task_id = context.get("task_id")
+        title = context.get("title")
+        if not task_id or not title:
+            return
+        action_title = self._action_title(action)
+        if action.action_type != "update_task" and action.action_type != "complete_task":
+            return
+        if action_title and self._normalize_title(action_title) != self._normalize_title(title):
+            return
+        action.target_task_id = task_id
 
     def _has_explicit_task_reference(self, text: str) -> bool:
         if text.startswith(("那个", "这条", "前", "第", "最后")):
@@ -298,6 +319,23 @@ class ConversationService:
         if text.startswith(("改到", "改成", "挪到", "推到", "提前", "延后", "放到", "再补一句", "补一句", "补充", "加一句", "做完了", "完成了", "勾掉", "勾选完成")):
             return False
         return " " in text or len(text) > 12
+
+    def _action_title(self, action: PlannedAction) -> str | None:
+        if action.action_type == "create_task":
+            value = action.payload.get("title")
+        elif action.action_type == "update_task":
+            value = action.payload.get("title") or action.payload.get("match_title")
+        elif action.action_type == "complete_task":
+            value = action.payload.get("title")
+        else:
+            value = None
+        if value is None:
+            return None
+        cleaned = str(value).strip()
+        return cleaned or None
+
+    def _normalize_title(self, value: str) -> str:
+        return "".join(value.casefold().split())
 
 
 class NoopConversationService(ConversationService):
