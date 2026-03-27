@@ -445,3 +445,39 @@ async def test_handle_update_processes_multiline_batch_sequentially() -> None:
         "任务“给导师发邮件”再补一句说明：记得带附件",
         "任务“给导师发邮件”放到 fun 那个 list",
     ]
+
+
+@pytest.mark.asyncio
+async def test_handle_update_returns_single_oauth_prompt_for_multiline_batch_when_disconnected() -> None:
+    planner = FakePlanner(PlannedConversation())
+    oauth_service = FakeTickTickOAuthService(
+        connected=False,
+        auth_url="https://ticktick.com/oauth/authorize?state=abc",
+    )
+    service = ConversationService(planner=planner, ticktick_oauth_service=oauth_service)
+    update = TelegramUpdate.model_validate(
+        {
+            "update_id": 11,
+            "message": {
+                "message_id": 17,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "明天下午3点提醒我给导师发邮件\n改到后天下午3点\n再补一句说明：记得带附件\n放到 fun 那个 list",
+            },
+        }
+    )
+
+    replies = await service.handle_update(update)
+
+    assert [reply.text for reply in replies] == [
+        "我还没连上你的 TickTick。先点这个链接授权一下，我连好后就能继续帮你了：https://ticktick.com/oauth/authorize?state=abc"
+    ]
+    assert planner.contexts == []
+    assert oauth_service.calls == [
+        {"method": "has_connection", "telegram_user_id": "99"},
+        {
+            "method": "create_authorization_url",
+            "telegram_user_id": "99",
+            "display_name": None,
+        },
+    ]

@@ -134,17 +134,23 @@ class ConversationService:
                 )
             return None
 
+        return await self._build_ticktick_auth_reply(
+            chat_id=update.message.chat.id,
+            telegram_user_id=telegram_user_id,
+        )
+
+    async def _build_ticktick_auth_reply(self, *, chat_id: int, telegram_user_id: str) -> TelegramReply:
         auth_url = await self._ticktick_oauth_service.create_authorization_url(
             telegram_user_id=telegram_user_id,
             display_name=None,
         )
         if auth_url:
             return TelegramReply(
-                chat_id=update.message.chat.id,
+                chat_id=chat_id,
                 text=f"我还没连上你的 TickTick。先点这个链接授权一下，我连好后就能继续帮你了：{auth_url}",
             )
         return TelegramReply(
-            chat_id=update.message.chat.id,
+            chat_id=chat_id,
             text="我知道你是在说 TickTick 相关的事，但现在还缺公开回调地址配置，所以还没法发你授权链接。",
         )
 
@@ -219,6 +225,22 @@ class ConversationService:
         lines = self._context_builder.split_lines(update.message.text)
         if len(lines) <= 1:
             return None
+        telegram_user_id = self._telegram_user_id(update)
+        if (
+            self._ticktick_oauth_service is not None
+            and telegram_user_id is not None
+            and any(self._looks_like_ticktick_request(line) for line in lines)
+        ):
+            connected = await self._ticktick_oauth_service.has_connection(
+                telegram_user_id=telegram_user_id
+            )
+            if not connected:
+                return [
+                    await self._build_ticktick_auth_reply(
+                        chat_id=update.message.chat.id,
+                        telegram_user_id=telegram_user_id,
+                    )
+                ]
 
         reply_texts: list[str] = []
         for line in lines:
