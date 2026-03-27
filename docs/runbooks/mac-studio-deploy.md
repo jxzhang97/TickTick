@@ -61,6 +61,29 @@ cd /Users/jiaxin/doc_unsyn/TickTick_Codex
 ./scripts/run_local_assistant.sh
 ```
 
+## Safe code sync
+
+Use the bundled sync script instead of a raw `rsync --delete` command:
+
+```bash
+cd /Users/jiaxin/doc_unsyn/TickTick_Codex
+```
+
+From the local machine:
+
+```bash
+/Users/jiaxinzhang/Documents/AI/plan2/.worktrees/ticktick-telegram-assistant/scripts/sync_to_studio.sh
+```
+
+This preserves remote state that must never be touched during deploys:
+
+- `.env`
+- `.venv/`
+- `assistant.db`
+- `logs/`
+
+Do not run a bare `rsync --delete` against the Studio checkout. For this local-hosted setup, preserving Studio state is more important than deleting stale files, because wiping `assistant.db` will erase the local OAuth/database state and force a new TickTick authorization.
+
 ## Install launchd service
 
 ```bash
