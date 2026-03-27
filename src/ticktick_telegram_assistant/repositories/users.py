@@ -16,3 +16,20 @@ class UserRepository:
             .one_or_none()
         )
 
+    def get_or_create(
+        self,
+        *,
+        telegram_user_id: str,
+        display_name: str | None = None,
+    ) -> User:
+        user = self.get_by_telegram_user_id(telegram_user_id)
+        if user is not None:
+            if display_name and not user.display_name:
+                user.display_name = display_name
+            return user
+
+        user = User(telegram_user_id=telegram_user_id, display_name=display_name)
+        if self._session is not None:
+            self._session.add(user)
+            self._session.flush()
+        return user

@@ -51,17 +51,20 @@ Use the helper script:
 
 ## Required Secrets
 
+- `PUBLIC_BASE_URL`
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_POLL_TIMEOUT_SECONDS`
 - `OPENAI_API_KEY`
 - `TICKTICK_CLIENT_ID`
 - `TICKTICK_CLIENT_SECRET`
+- `TICKTICK_SCOPE` (optional if your TickTick app uses default scopes)
 - `DATABASE_URL`
 
 ## Deployment Notes
 
 - Telegram polling is the default receive mode for local hosting.
 - TickTick OAuth callback is exposed locally at `/auth/ticktick/callback`.
+- To complete TickTick OAuth on a self-hosted Mac, `PUBLIC_BASE_URL` must point to a temporary or permanent HTTPS address that can reach the local API.
 - If Docker is unavailable, set `DATABASE_URL=sqlite:///./assistant.db` and the helper script will skip Postgres startup.
 - For Mac Studio deployment and `launchd` setup, see `docs/runbooks/mac-studio-deploy.md`.
 

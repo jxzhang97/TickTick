@@ -62,3 +62,8 @@ class EveningReviewReply(BaseModel):
 class TelegramReply(BaseModel):
     chat_id: int
     text: str
+
+
+class TickTickOAuthConnectionResult(BaseModel):
+    connected: bool
+    message: str

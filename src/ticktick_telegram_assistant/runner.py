@@ -3,9 +3,12 @@ from __future__ import annotations
 import asyncio
 
 from ticktick_telegram_assistant.config import Settings
+from ticktick_telegram_assistant.db.session import create_session_factory
 from ticktick_telegram_assistant.integrations.telegram_client import TelegramClient
 from ticktick_telegram_assistant.integrations.telegram_poller import TelegramPoller
+from ticktick_telegram_assistant.integrations.ticktick_oauth_client import TickTickOAuthClient
 from ticktick_telegram_assistant.services.conversation_service import ConversationService
+from ticktick_telegram_assistant.services.ticktick_oauth_service import TickTickOAuthService
 from ticktick_telegram_assistant.workers.reminder_worker import ReminderWorker
 
 
@@ -42,7 +45,19 @@ class LocalAssistantRunner:
 def build_local_runner(settings: Settings | None = None) -> LocalAssistantRunner:
     app_settings = settings or Settings()
     telegram_client = TelegramClient(token=app_settings.telegram_bot_token)
-    conversation_service = ConversationService()
+    session_factory = create_session_factory(app_settings)
+    ticktick_oauth_service = TickTickOAuthService(
+        settings=app_settings,
+        session_factory=session_factory,
+        oauth_client=TickTickOAuthClient(
+            client_id=app_settings.ticktick_client_id,
+            client_secret=app_settings.ticktick_client_secret,
+            token_url=app_settings.ticktick_token_url,
+        ),
+    )
+    conversation_service = ConversationService(
+        ticktick_oauth_service=ticktick_oauth_service,
+    )
     poller = TelegramPoller(
         telegram_client=telegram_client,
         conversation_service=conversation_service,
