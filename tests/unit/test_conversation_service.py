@@ -1274,6 +1274,81 @@ async def test_handle_update_processes_multiline_batch_sequentially() -> None:
 
 
 @pytest.mark.asyncio
+async def test_handle_update_normalizes_bulleted_multiline_batch_before_planning() -> None:
+    planner = FakePlanner(
+        [
+            PlannedConversation(
+                actions=[{"action_type": "complete_task", "payload": {"title": "和家里打电话"}}]
+            ),
+            PlannedConversation(
+                actions=[
+                    {
+                        "action_type": "update_task",
+                        "payload": {"match_title": "回复PRL Referee", "due_at": "2026-04-03T18:00:00-07:00"},
+                    }
+                ]
+            ),
+            PlannedConversation(
+                actions=[
+                    {
+                        "action_type": "update_task",
+                        "payload": {"match_title": "和完周全聊聊", "semantic_type": "windowed"},
+                    }
+                ]
+            ),
+            PlannedConversation(
+                actions=[
+                    {
+                        "action_type": "update_task",
+                        "payload": {"match_title": "处理ds2019的事情", "due_at": "2026-03-29T22:00:00-07:00"},
+                    }
+                ]
+            ),
+            PlannedConversation(
+                actions=[
+                    {
+                        "action_type": "update_task",
+                        "payload": {
+                            "match_title": "时间阅读https://openai.com/zh-Hant-HK/index/harness-engineering/",
+                            "semantic_type": "windowed",
+                        },
+                    }
+                ]
+            ),
+        ]
+    )
+    oauth_service = FakeTickTickOAuthService(connected=True, auth_url=None)
+    task_command_service = FakeTaskCommandService(reply_text="ok")
+    service = ConversationService(
+        planner=planner,
+        ticktick_oauth_service=oauth_service,
+        task_command_service=task_command_service,
+    )
+    update = TelegramUpdate.model_validate(
+        {
+            "update_id": 10_1,
+            "message": {
+                "message_id": 16_1,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "• 和家里打电话已完成\n• 回复PRL Referee 改到 4月3号\n• 和完周全聊聊改到下周\n• 处理ds2019的事情 改到今天晚上10点\n• 时间阅读https://openai.com/zh-Hant-HK/index/harness-engineering/移动到下周",
+            },
+        }
+    )
+
+    replies = await service.handle_update(update)
+
+    assert [reply.text for reply in replies] == ["ok\nok\nok\nok\nok"]
+    assert [context.user_text for context in planner.contexts] == [
+        "和家里打电话完成了",
+        "回复PRL Referee 改到 4月3号",
+        "和完周全聊聊改到下周",
+        "处理ds2019的事情 改到今天晚上10点",
+        "时间阅读https://openai.com/zh-Hant-HK/index/harness-engineering/改到下周",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_handle_update_processes_following_batch_lines_after_confirmation_prompt() -> None:
     session_factory = make_session_factory()
     with session_factory() as session:

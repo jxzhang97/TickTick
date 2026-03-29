@@ -127,6 +127,7 @@ class ConversationService:
             return [location_reply]
         if update.message.text is None:
             return []
+        update = self._normalize_text_update(update)
         self._record_turn_summary(
             telegram_user_id=self._telegram_user_id(update),
             text=update.message.text,
@@ -217,6 +218,42 @@ class ConversationService:
         if trace is not None:
             trace["status"] = "assistant_reply"
         return [TelegramReply(chat_id=update.message.chat.id, text=reply_text)]
+
+    def _normalize_text_update(self, update: TelegramUpdate) -> TelegramUpdate:
+        if update.message is None or update.message.text is None:
+            return update
+        normalized_text = "\n".join(
+            self._normalize_message_line(line)
+            for line in update.message.text.splitlines()
+            if line.strip()
+        ).strip()
+        if not normalized_text or normalized_text == update.message.text:
+            return update
+        return update.model_copy(
+            deep=True,
+            update={
+                "message": update.message.model_copy(
+                    deep=True,
+                    update={"text": normalized_text},
+                )
+            },
+        )
+
+    def _normalize_message_line(self, text: str) -> str:
+        cleaned = text.strip()
+        cleaned = re.sub(r"^\s*(?:[-*•·●▪︎◦]+|\d+[.)、]|[一二三四五六七八九十]+[、.])\s*", "", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        cleaned = re.sub(r"已完成\s*$", "完成了", cleaned)
+        cleaned = re.sub(r"已做完\s*$", "做完了", cleaned)
+        cleaned = self._normalize_move_to_schedule(cleaned)
+        return cleaned
+
+    def _normalize_move_to_schedule(self, text: str) -> str:
+        time_like_pattern = (
+            r"(今天|今晚|今早|明天|明早|明晚|后天|下周|这周|本周|周末|月底|月初|"
+            r"\d{1,2}月\d{1,2}(?:号|日)?|\d{1,2}号|周[一二三四五六日天]|上午|中午|下午|晚上)"
+        )
+        return re.sub(rf"移动到(?={time_like_pattern})", "改到", text)
 
     async def update_user_timezone(self, *, user_id: int, timezone_name: str, source: str) -> None:
         self._user_timezones[user_id] = {"timezone_name": timezone_name, "source": source}
