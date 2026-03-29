@@ -255,6 +255,35 @@ async def test_handle_update_recognizes_today_todo_question_as_today_brief() -> 
 
 
 @pytest.mark.asyncio
+async def test_handle_update_recognizes_today_ganma_question_as_today_brief() -> None:
+    planner = FakePlanner(PlannedConversation())
+    oauth_service = FakeTickTickOAuthService(connected=True, auth_url=None)
+    today_brief_service = FakeTodayBriefService("今天重点：\n- 先做 A")
+    service = ConversationService(
+        planner=planner,
+        ticktick_oauth_service=oauth_service,
+        today_brief_service=today_brief_service,
+    )
+    update = TelegramUpdate.model_validate(
+        {
+            "update_id": 4_2,
+            "message": {
+                "message_id": 10_2,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "今天要干嘛",
+            },
+        }
+    )
+
+    replies = await service.handle_update(update)
+
+    assert [reply.text for reply in replies] == ["今天重点：\n- 先做 A"]
+    assert planner.contexts == []
+    assert len(today_brief_service.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_handle_update_executes_create_action_when_ticktick_connected() -> None:
     planner = FakePlanner(
         PlannedConversation(

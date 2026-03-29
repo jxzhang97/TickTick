@@ -406,7 +406,7 @@ class ConversationService:
             return True
         return bool(
             re.search(
-                r"(今天|今日).*(要做什么|做什么|干什么|该做什么|有什么事|有哪些事|有什么要做)",
+                r"(今天|今日).*(要做什么|做什么|干什么|干嘛|该做什么|有什么事|有哪些事|有什么要做)",
                 text,
             )
         )
