@@ -76,6 +76,16 @@ def test_memory_service_builds_context_with_relevant_memory_items() -> None:
         )
         repo.upsert_fact(
             user_id=99,
+            key="给导师A发邮件",
+            value_json={
+                "selected_title": "给导师A发邮件",
+                "selected_task_id": "existing-2",
+                "selected_when": "周二 15:00",
+            },
+            memory_type=MemoryType.DISAMBIGUATION_PATTERN,
+        )
+        repo.upsert_fact(
+            user_id=99,
             key="tone_style",
             value_json={"value": "简短"},
             memory_type=MemoryType.PREFERENCE,
@@ -84,13 +94,13 @@ def test_memory_service_builds_context_with_relevant_memory_items() -> None:
 
     context = service.build_context(
         user_id=99,
-        text="老王，明天下午提醒我一下",
+        text="老王，明天下午提醒我一下，给导师A发邮件再补一句说明",
         current_timezone="America/Los_Angeles",
         now=datetime.fromisoformat("2026-03-27T09:00:00-07:00"),
         candidate_tasks=["task-1: 给导师发邮件"],
     )
 
-    assert context.user_text == "老王，明天下午提醒我一下"
+    assert context.user_text == "老王，明天下午提醒我一下，给导师A发邮件再补一句说明"
     assert context.current_timezone == "America/Los_Angeles"
     assert context.current_local_time == "2026-03-27T09:00:00-07:00"
     assert context.candidate_tasks == ["task-1: 给导师发邮件"]
@@ -102,6 +112,7 @@ def test_memory_service_builds_context_with_relevant_memory_items() -> None:
         "conversation_summary: 用户提到明天下午要提醒。",
         "conversation_summary: 用户偏好简短回复。",
         "alias_mapping: 老王 -> 王老师",
+        "disambiguation_pattern: 给导师A发邮件 -> 给导师A发邮件 (周二 15:00)",
         "time_expression: 明天下午 -> 2026-03-28T15:00:00-07:00",
     ]
 

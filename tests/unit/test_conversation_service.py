@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from ticktick_telegram_assistant.db.base import Base
 from ticktick_telegram_assistant.db.models.reminder_event import ReminderEvent
+from ticktick_telegram_assistant.db.models.memory_fact import MemoryFact
 from ticktick_telegram_assistant.db.models.user import User
 from ticktick_telegram_assistant.domain.enums import MemoryType
 from ticktick_telegram_assistant.domain.schemas import PlannedConversation
@@ -1282,11 +1283,151 @@ async def test_handle_update_builds_planner_context_from_memory_service() -> Non
 
     await service.handle_update(update)
 
-    assert planner.contexts[0].recent_conversation_summaries == ["最近提到：放到 fun 那个 list"]
+    assert planner.contexts[0].recent_conversation_summaries == ["移动到 list：fun"]
     assert planner.contexts[0].memory_items == [
-        "conversation_summary: 最近提到：放到 fun 那个 list",
+        "conversation_summary: 移动到 list：fun",
         "alias_mapping: fun list -> fun",
     ]
+
+
+@pytest.mark.asyncio
+async def test_handle_update_records_time_expression_and_alias_mappings_after_successful_create() -> None:
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        user = User(
+            telegram_user_id="99",
+            display_name="Jiaxin",
+            current_timezone="America/Los_Angeles",
+        )
+        session.add(user)
+        session.commit()
+
+    planner = FakePlanner(
+        PlannedConversation(
+            actions=[
+                {
+                    "action_type": "create_task",
+                    "payload": {
+                        "title": "给导师发邮件",
+                        "semantic_type": "explicit_time",
+                        "due_at": "2026-03-28T15:00:00-07:00",
+                        "raw_nl_time": "明天下午3点",
+                        "list_name": "fun list",
+                        "tags": ["work"],
+                    },
+                }
+            ]
+        )
+    )
+    memory_service = MemoryService(session_factory=session_factory)
+    task_command_service = FakeTaskCommandService(
+        reply_text="好，我已经替你记进 TickTick 了：周六 15:00 给导师发邮件",
+        created_task_id="task-memory-1",
+    )
+    service = ConversationService(
+        planner=planner,
+        task_command_service=task_command_service,
+        session_factory=session_factory,
+        memory_service=memory_service,
+    )
+    update = TelegramUpdate.model_validate(
+        {
+            "update_id": 15_1,
+            "message": {
+                "message_id": 21_1,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "明天下午3点提醒我给导师发邮件，放到 fun list，打上 work 标签",
+            },
+        }
+    )
+
+    replies = await service.handle_update(update)
+
+    assert [reply.text for reply in replies] == ["好，我已经替你记进 TickTick 了：周六 15:00 给导师发邮件"]
+    with session_factory() as session:
+        facts = session.query(MemoryFact).order_by(MemoryFact.id.asc()).all()
+
+    by_type_and_key = {(fact.memory_type, fact.key): fact for fact in facts}
+    assert by_type_and_key[("time_expression", "明天下午3点")].value_json["resolved_due_at"] == "2026-03-28T15:00:00-07:00"
+    assert by_type_and_key[("time_expression", "明天下午3点")].source_type == "task_execution"
+    assert by_type_and_key[("alias_mapping", "fun list")].value_json == {"canonical_name": "fun list", "kind": "list"}
+    assert by_type_and_key[("alias_mapping", "work")].value_json == {"canonical_name": "work", "kind": "tag"}
+
+
+@pytest.mark.asyncio
+async def test_handle_update_records_disambiguation_pattern_when_selection_is_confirmed() -> None:
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        user = User(
+            telegram_user_id="99",
+            display_name="Jiaxin",
+            current_timezone="America/Los_Angeles",
+        )
+        session.add(user)
+        session.flush()
+        user_id = user.id
+        session.commit()
+
+    memory_service = MemoryService(session_factory=session_factory)
+    memory_service.replace_active_context(
+        user_id=user_id,
+        context_type="pending_confirmation",
+        payload_json={
+            "kind": "task_disambiguation",
+            "candidate_tasks": [
+                {"task_id": "existing-1", "title": "给导师A发邮件", "when": "周一 15:00"},
+                {"task_id": "existing-2", "title": "给导师A发邮件", "when": "周二 15:00"},
+            ],
+            "original_action": {
+                "action_type": "update_task",
+                "payload": {
+                    "match_title": "给导师A发邮件",
+                    "description": "记得带附件",
+                },
+            },
+        },
+    )
+    task_command_service = FakeTaskCommandService("updated")
+    service = ConversationService(
+        task_command_service=task_command_service,
+        session_factory=session_factory,
+        memory_service=memory_service,
+    )
+    update = TelegramUpdate.model_validate(
+        {
+            "update_id": 15_2,
+            "message": {
+                "message_id": 21_2,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "第二条",
+            },
+        }
+    )
+
+    replies = await service.handle_update(update)
+
+    assert [reply.text for reply in replies] == ["updated"]
+    with session_factory() as session:
+        fact = (
+            session.query(MemoryFact)
+            .filter(
+                MemoryFact.user_id == user_id,
+                MemoryFact.memory_type == MemoryType.DISAMBIGUATION_PATTERN.value,
+                MemoryFact.key == "给导师A发邮件",
+            )
+            .one()
+        )
+
+    assert fact.value_json["selected_task_id"] == "existing-2"
+    assert fact.value_json["selected_title"] == "给导师A发邮件"
+    context = memory_service.build_context(
+        user_id=user_id,
+        text="给导师A发邮件再补一句说明",
+        current_timezone="America/Los_Angeles",
+    )
+    assert any(item.startswith("disambiguation_pattern: 给导师A发邮件 ->") for item in context.memory_items)
 
 
 @pytest.mark.asyncio

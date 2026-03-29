@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session, sessionmaker
 
 from ticktick_telegram_assistant.db.models.reminder_event import ReminderEvent
+from ticktick_telegram_assistant.db.models.task_shadow import TaskShadow
 from ticktick_telegram_assistant.db.models.user import User
 from ticktick_telegram_assistant.domain.enums import MemoryType
 from ticktick_telegram_assistant.domain.schemas import (
@@ -226,6 +227,11 @@ class ConversationService:
                 )
             )
             self._store_active_task_context(telegram_user_id=telegram_user_id, action=action)
+            self._record_successful_action_memory(
+                telegram_user_id=telegram_user_id,
+                action=action,
+                source_text=candidate["title"],
+            )
 
         for index in parsed.rescheduled_indices:
             if index >= len(candidates):
@@ -253,6 +259,11 @@ class ConversationService:
                 )
             )
             self._store_active_task_context(telegram_user_id=telegram_user_id, action=action)
+            self._record_successful_action_memory(
+                telegram_user_id=telegram_user_id,
+                action=action,
+                source_text=f"任务“{candidate['title']}”改到{time_phrase}",
+            )
 
         reply_text = "\n".join(item for item in reply_texts if item)
         return [TelegramReply(chat_id=chat_id, text=reply_text)]
@@ -421,6 +432,11 @@ class ConversationService:
             action=action,
         )
         self._store_active_task_context(telegram_user_id=telegram_user_id, action=action)
+        self._record_successful_action_memory(
+            telegram_user_id=telegram_user_id,
+            action=action,
+            source_text=update.message.text,
+        )
         return TelegramReply(chat_id=update.message.chat.id, text=reply_text)
 
     def _save_planner_confirmation(
@@ -1126,10 +1142,15 @@ class ConversationService:
 
     async def _execute_original_confirmation(self, *, telegram_user_id: str, context: dict) -> str:
         action = PlannedAction.model_validate(context["original_action"])
-        return await self._task_command_service.execute_action(
+        reply_text = await self._task_command_service.execute_action(
             telegram_user_id=telegram_user_id,
             action=action,
         )
+        self._record_successful_action_memory(
+            telegram_user_id=telegram_user_id,
+            action=action,
+        )
+        return reply_text
 
     async def _execute_merge_confirmation(self, *, telegram_user_id: str, context: dict) -> str:
         original_action = PlannedAction.model_validate(context["original_action"])
@@ -1144,10 +1165,15 @@ class ConversationService:
             target_task_id=candidate.get("task_id"),
             payload=payload,
         )
-        return await self._task_command_service.execute_action(
+        reply_text = await self._task_command_service.execute_action(
             telegram_user_id=telegram_user_id,
             action=action,
         )
+        self._record_successful_action_memory(
+            telegram_user_id=telegram_user_id,
+            action=action,
+        )
+        return reply_text
 
     async def _execute_rescheduled_confirmation(
         self,
@@ -1178,10 +1204,16 @@ class ConversationService:
         if original_action.action_type != "create_task":
             action.target_task_id = candidate.get("task_id")
             action.payload.setdefault("match_title", candidate.get("title") or title)
-        return await self._task_command_service.execute_action(
+        reply_text = await self._task_command_service.execute_action(
             telegram_user_id=telegram_user_id,
             action=action,
         )
+        self._record_successful_action_memory(
+            telegram_user_id=telegram_user_id,
+            action=action,
+            source_text=user_text,
+        )
+        return reply_text
 
     async def _execute_memo_schedule_candidate(
         self,
@@ -1211,10 +1243,16 @@ class ConversationService:
         action.target_task_id = task_id
         action.payload.setdefault("match_title", title)
         action.payload.setdefault("semantic_type", "explicit_time")
-        return await self._task_command_service.execute_action(
+        reply_text = await self._task_command_service.execute_action(
             telegram_user_id=telegram_user_id,
             action=action,
         )
+        self._record_successful_action_memory(
+            telegram_user_id=telegram_user_id,
+            action=action,
+            source_text=user_text,
+        )
+        return reply_text
 
     async def _execute_task_disambiguation_confirmation(
         self,
@@ -1234,10 +1272,20 @@ class ConversationService:
             action.payload.setdefault("match_title", candidate_title)
         if action.action_type == "complete_task" and candidate_title:
             action.payload["title"] = candidate_title
-        return await self._task_command_service.execute_action(
+        reply_text = await self._task_command_service.execute_action(
             telegram_user_id=telegram_user_id,
             action=action,
         )
+        self._record_successful_action_memory(
+            telegram_user_id=telegram_user_id,
+            action=action,
+        )
+        self._record_disambiguation_memory(
+            telegram_user_id=telegram_user_id,
+            context=context,
+            selected_index=selected_index,
+        )
+        return reply_text
 
     def _save_pending_confirmation(self, *, telegram_user_id: str, payload: dict) -> None:
         if self._memory_service is None:
@@ -1597,6 +1645,246 @@ class ConversationService:
         with self._session_factory() as session:
             return UserRepository(session).get_by_telegram_user_id(telegram_user_id)
 
+    def _clean_optional_text(self, value: object | None) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    def _record_successful_action_memory(
+        self,
+        *,
+        telegram_user_id: str,
+        action: PlannedAction,
+        source_text: str | None = None,
+    ) -> None:
+        if self._memory_service is None:
+            return
+        user = self._get_user_by_telegram_user_id(telegram_user_id)
+        if user is None:
+            return
+        now = datetime.now(timezone.utc)
+        self._record_time_expression_memory(
+            user_id=user.id,
+            action=action,
+            source_text=source_text,
+            last_confirmed_at=now,
+        )
+        self._record_alias_mappings_for_action(
+            user_id=user.id,
+            action=action,
+            last_confirmed_at=now,
+        )
+
+    def _record_disambiguation_memory(
+        self,
+        *,
+        telegram_user_id: str,
+        context: dict,
+        selected_index: int,
+    ) -> None:
+        if self._memory_service is None:
+            return
+        user = self._get_user_by_telegram_user_id(telegram_user_id)
+        if user is None:
+            return
+        candidate_tasks = context.get("candidate_tasks") or []
+        if not (0 <= selected_index < len(candidate_tasks)):
+            return
+        original_action = PlannedAction.model_validate(context["original_action"])
+        requested_title = self._target_lookup_title(original_action)
+        if not requested_title:
+            return
+        candidate = candidate_tasks[selected_index]
+        selected_title = str(candidate.get("title") or "").strip()
+        if not selected_title:
+            return
+        candidate_titles = [
+            str(item.get("title") or "").strip()
+            for item in candidate_tasks
+            if str(item.get("title") or "").strip()
+        ]
+        self._memory_service.record_disambiguation_pattern(
+            user_id=user.id,
+            key=requested_title,
+            selected_title=selected_title,
+            selected_task_id=str(candidate.get("task_id") or "").strip() or None,
+            selected_when=str(candidate.get("when") or "").strip() or None,
+            candidate_titles=candidate_titles or None,
+            selection_index=selected_index + 1,
+            source_type="user_confirmation",
+            last_confirmed_at=datetime.now(timezone.utc),
+        )
+
+    def _record_time_expression_memory(
+        self,
+        *,
+        user_id: int,
+        action: PlannedAction,
+        source_text: str | None,
+        last_confirmed_at: datetime,
+    ) -> None:
+        raw_nl_time = self._clean_optional_text(action.payload.get("raw_nl_time"))
+        if raw_nl_time is None and source_text is not None:
+            raw_nl_time = self._extract_time_expression_text(source_text)
+        if raw_nl_time is None:
+            return
+        start_at = self._coerce_datetime(action.payload.get("start_at"))
+        due_at = self._coerce_datetime(action.payload.get("due_at"))
+        end_at = self._coerce_datetime(action.payload.get("end_at"))
+        duration_minutes = self._coerce_duration_minutes(action.payload.get("duration_minutes"))
+        start_at, due_at, end_at = self._resolve_time_span(
+            start_at=start_at,
+            due_at=due_at,
+            end_at=end_at,
+            duration_minutes=duration_minutes,
+        )
+        window_start = self._coerce_datetime(action.payload.get("window_start"))
+        window_end = self._coerce_datetime(action.payload.get("window_end"))
+        if due_at is None and start_at is None and end_at is None and window_start is None and window_end is None:
+            return
+        self._memory_service.record_time_expression(
+            user_id=user_id,
+            raw_nl_time=raw_nl_time,
+            resolved_due_at=due_at,
+            resolved_window_start=window_start,
+            resolved_window_end=window_end,
+            semantic_type=self._clean_optional_text(action.payload.get("semantic_type")),
+            source_type="task_execution",
+            last_confirmed_at=last_confirmed_at,
+        )
+
+    def _record_alias_mappings_for_action(
+        self,
+        *,
+        user_id: int,
+        action: PlannedAction,
+        last_confirmed_at: datetime,
+    ) -> None:
+        if action.action_type not in {"create_task", "update_task"}:
+            return
+        list_name = self._clean_optional_text(action.payload.get("list_name"))
+        tags = self._normalize_text_list(action.payload.get("tags"))
+        if not list_name and not tags:
+            return
+
+        canonical_list_name = list_name
+        canonical_tags = list(tags)
+        if action.target_task_id:
+            shadow = self._load_task_shadow(user_id=user_id, task_id=action.target_task_id)
+            if shadow is not None:
+                if shadow.list_name:
+                    canonical_list_name = shadow.list_name
+                if shadow.tags_json:
+                    canonical_tags = [
+                        str(item).strip()
+                        for item in shadow.tags_json
+                        if str(item).strip()
+                    ] or canonical_tags
+
+        if list_name and canonical_list_name:
+            self._memory_service.record_alias_mapping(
+                user_id=user_id,
+                alias=list_name,
+                canonical_name=canonical_list_name,
+                kind="list",
+                source_type="task_execution",
+                last_confirmed_at=last_confirmed_at,
+            )
+
+        for tag in tags:
+            canonical_tag = next(
+                (candidate for candidate in canonical_tags if candidate.casefold() == tag.casefold()),
+                tag,
+            )
+            self._memory_service.record_alias_mapping(
+                user_id=user_id,
+                alias=tag,
+                canonical_name=canonical_tag,
+                kind="tag",
+                source_type="task_execution",
+                last_confirmed_at=last_confirmed_at,
+            )
+
+    def _load_task_shadow(self, *, user_id: int, task_id: str) -> TaskShadow | None:
+        if self._session_factory is None:
+            return None
+        with self._session_factory() as session:
+            return (
+                session.query(TaskShadow)
+                .filter(TaskShadow.user_id == user_id, TaskShadow.ticktick_task_id == task_id)
+                .one_or_none()
+            )
+
+    def _normalize_text_list(self, value: object | None) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, (list, tuple, set)):
+            raw_items = list(value)
+        elif isinstance(value, str):
+            raw_items = [part.strip() for part in value.split(",")]
+        else:
+            raw_items = [value]
+        cleaned_items: list[str] = []
+        for item in raw_items:
+            text = str(item).strip()
+            if text and text not in cleaned_items:
+                cleaned_items.append(text)
+        return cleaned_items
+
+    def _build_conversation_summary(self, text: str) -> str:
+        cleaned = " ".join(text.strip().split())
+        if not cleaned:
+            return "空消息"
+        if self._looks_like_today_brief_request(cleaned):
+            return "查询今天安排"
+        list_alias = self._extract_list_alias(cleaned)
+        if list_alias and any(token in cleaned for token in ("放到", "移到", "加到", "放进", "加入")):
+            return f"移动到 list：{list_alias}"
+        if any(token in cleaned for token in ("做完", "完成", "勾掉", "勾选")):
+            return f"完成任务：{self._strip_summary_filler(cleaned)[:80]}"
+        if any(token in cleaned for token in ("改到", "改成", "挪到", "推到", "提前", "延后", "补一句", "放到")):
+            return f"修改任务：{self._strip_summary_filler(cleaned)[:80]}"
+        if any(token in cleaned for token in ("提醒", "记一下", "记住", "新增", "新建", "添加")):
+            time_phrase = self._extract_time_expression_text(cleaned)
+            body = self._strip_summary_filler(cleaned)
+            if time_phrase and time_phrase in body:
+                body = body.replace(time_phrase, "").strip(" ，,。；;")
+                if body:
+                    return f"提醒：{time_phrase} {body[:60]}"
+                return f"提醒：{time_phrase}"
+            return f"提醒：{body[:80]}"
+        return self._strip_summary_filler(cleaned)[:120]
+
+    def _strip_summary_filler(self, text: str) -> str:
+        cleaned = text.strip()
+        cleaned = re.sub(r"^(请|麻烦)?帮我把?\s*", "", cleaned)
+        cleaned = re.sub(r"^(请|麻烦)?帮我\s*", "", cleaned)
+        cleaned = re.sub(r"^提醒我\s*", "", cleaned)
+        cleaned = re.sub(r"^(记一下|记住|安排一下|安排|新建|新增|添加|设置)\s*", "", cleaned)
+        cleaned = cleaned.replace("那个 list", "list")
+        cleaned = cleaned.replace("这个 list", "list")
+        cleaned = cleaned.replace("那个", "")
+        cleaned = cleaned.replace("这个", "")
+        return cleaned.strip(" ，,。；;")
+
+    def _extract_list_alias(self, text: str) -> str | None:
+        match = re.search(r"(?:放到|移到|加到|放进|加入)\s*(.+?)(?:那个|这个)?\s*(?:list|清单|文件夹|tag|标签)", text)
+        if not match:
+            return None
+        return self._strip_summary_filler(match.group(1))
+
+    def _extract_time_expression_text(self, text: str) -> str | None:
+        match = re.search(
+            r"((?:今天|明天|后天|今晚|明早|明晚|下周[一二三四五六日天]?|这周[一二三四五六日天]?|本周[一二三四五六日天]?|月底前|这两周|周末|工作日|周[一二三四五六日天])"
+            r"(?:\s*(?:上午|下午|中午|晚上|凌晨)?)?"
+            r"(?:\s*\d{1,2}(?:[:：]\d{2})?(?:点|时)?(?:半|一刻|三刻)?)?)",
+            text,
+        )
+        if not match:
+            return None
+        return match.group(1).strip()
+
     def _record_turn_summary(self, *, telegram_user_id: str | None, text: str) -> None:
         if telegram_user_id is None or self._memory_service is None:
             return
@@ -1605,7 +1893,7 @@ class ConversationService:
             return
         self._memory_service.save_conversation_summary(
             user_id=user.id,
-            summary_text=f"最近提到：{text.strip()[:120]}",
+            summary_text=self._build_conversation_summary(text),
         )
         self._memory_service.upsert_fact(
             user_id=user.id,

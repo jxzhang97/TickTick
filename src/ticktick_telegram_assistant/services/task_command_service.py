@@ -232,7 +232,8 @@ class TaskCommandService:
         return f"好，这条我帮你勾完成了：{match_or_reply.title}"
 
     async def _update_task(self, *, telegram_user_id: str, action: PlannedAction) -> str:
-        match_title = self._clean_optional_text(action.payload.get("match_title"))
+        payload = action.payload
+        match_title = self._clean_optional_text(payload.get("match_title"))
 
         with self._session_factory() as session:
             user = UserRepository(session).get_by_telegram_user_id(telegram_user_id)
@@ -253,7 +254,7 @@ class TaskCommandService:
             return match_or_reply
 
         target_task = match_or_reply
-        requested_list_name = self._clean_optional_text(action.payload.get("list_name"))
+        requested_list_name = self._clean_optional_text(payload.get("list_name"))
         target_project_id = target_task.projectId
         target_list_name: Optional[str] = None
         if requested_list_name:
@@ -264,34 +265,48 @@ class TaskCommandService:
             target_project_id = target_project.id
             target_list_name = target_project.name
 
-        description = self._clean_optional_text(action.payload.get("description"))
-        description_mode = self._clean_optional_text(action.payload.get("description_mode")) or "replace"
-        due_at = self._coerce_datetime(action.payload.get("due_at"))
-        start_at = self._coerce_datetime(action.payload.get("start_at"))
-        end_at = self._coerce_datetime(action.payload.get("end_at"))
-        duration_minutes = self._coerce_duration_minutes(action.payload.get("duration_minutes"))
+        with self._session_factory() as session:
+            existing_shadow = (
+                session.query(TaskShadow)
+                .filter(TaskShadow.ticktick_task_id == target_task.id)
+                .one_or_none()
+            )
+
+        description_present = "description" in payload
+        description = self._clean_optional_text(payload.get("description")) if description_present else None
+        description_mode = self._clean_optional_text(payload.get("description_mode")) or "replace"
+        due_at_present = "due_at" in payload
+        due_at = self._coerce_datetime(payload.get("due_at")) if due_at_present else None
+        start_at_present = "start_at" in payload
+        start_at = self._coerce_datetime(payload.get("start_at")) if start_at_present else None
+        end_at_present = "end_at" in payload
+        end_at = self._coerce_datetime(payload.get("end_at")) if end_at_present else None
+        duration_present = "duration_minutes" in payload
+        duration_minutes = self._coerce_duration_minutes(payload.get("duration_minutes")) if duration_present else None
         start_at, due_at, end_at = self._resolve_time_span(
             start_at=start_at,
             due_at=due_at,
             end_at=end_at,
             duration_minutes=duration_minutes,
         )
-        semantic_type = self._resolve_semantic_type(
-            explicit_value=self._clean_optional_text(action.payload.get("semantic_type")),
-            start_at=start_at,
-            due_at=due_at,
-            window_start=None,
-            window_end=None,
-            fallback=None,
-        )
-        raw_nl_time = self._clean_optional_text(action.payload.get("raw_nl_time"))
-        repeat_rule = self._normalize_repeat_rule(
-            action.payload.get("repeat_rule") or action.payload.get("repeatFlag")
-        )
-        priority = self._coerce_priority(action.payload.get("priority"))
-        tags = self._normalize_tags(action.payload.get("tags"))
-        checklist_items = self._extract_checklist_items(action.payload)
-        new_title = self._clean_optional_text(action.payload.get("title"))
+        semantic_type_present = "semantic_type" in payload
+        semantic_type = self._clean_optional_text(payload.get("semantic_type")) if semantic_type_present else None
+        window_start_present = "window_start" in payload
+        window_start = self._coerce_datetime(payload.get("window_start")) if window_start_present else None
+        window_end_present = "window_end" in payload
+        window_end = self._coerce_datetime(payload.get("window_end")) if window_end_present else None
+        raw_nl_time_present = "raw_nl_time" in payload
+        raw_nl_time = self._clean_optional_text(payload.get("raw_nl_time")) if raw_nl_time_present else None
+        repeat_rule_present = "repeat_rule" in payload or "repeatFlag" in payload
+        repeat_rule = self._resolve_repeat_rule_update(payload) if repeat_rule_present else None
+        priority_present = "priority" in payload
+        priority = self._coerce_priority(payload.get("priority")) if priority_present else None
+        tags_present = "tags" in payload
+        tags = self._normalize_tags(payload.get("tags")) if tags_present else []
+        checklist_present = any(key in payload for key in ("subtasks", "checklist", "items"))
+        checklist_items = self._extract_checklist_items(payload) if checklist_present else []
+        new_title_present = "title" in payload
+        new_title = self._clean_optional_text(payload.get("title")) if new_title_present else None
         if new_title and match_title and self._normalize_title(new_title) == self._normalize_title(match_title):
             new_title = None
 
@@ -301,32 +316,88 @@ class TaskCommandService:
             mode=description_mode,
         )
 
+        effective_semantic_type = semantic_type
+        if effective_semantic_type is None:
+            if due_at is not None or start_at is not None:
+                effective_semantic_type = "explicit_time"
+            elif window_start is not None or window_end is not None:
+                effective_semantic_type = "windowed"
+            elif existing_shadow is not None:
+                effective_semantic_type = existing_shadow.semantic_type
+
+        time_or_metadata_present = any(
+            [
+                due_at_present,
+                start_at_present,
+                end_at_present,
+                duration_present,
+                semantic_type_present,
+                window_start_present,
+                window_end_present,
+                raw_nl_time_present,
+            ]
+        )
+        if effective_semantic_type == "windowed":
+            if raw_nl_time_present:
+                window_text = raw_nl_time
+            elif window_start_present or window_end_present:
+                window_text = None
+            elif existing_shadow is not None and existing_shadow.semantic_type == "windowed":
+                window_text = existing_shadow.raw_nl_time
+            else:
+                window_text = None
+            base_description = updated_description if updated_description is not None else target_task.desc
+            synced_description = self._sync_window_description(base_description, window_text)
+            if updated_description is not None:
+                if synced_description != updated_description:
+                    updated_description = synced_description
+            elif synced_description != target_task.desc:
+                updated_description = synced_description
+        elif time_or_metadata_present:
+            base_description = updated_description if updated_description is not None else target_task.desc
+            synced_description = self._sync_window_description(base_description, None)
+            if updated_description is not None:
+                if synced_description != updated_description:
+                    updated_description = synced_description
+            elif synced_description != target_task.desc:
+                updated_description = synced_description
+
         if (
-            due_at is None
-            and start_at is None
+            not time_or_metadata_present
             and updated_description is None
             and new_title is None
             and target_project_id == target_task.projectId
-            and not repeat_rule
-            and priority is None
-            and not tags
-            and not checklist_items
+            and not repeat_rule_present
+            and not priority_present
+            and not tags_present
+            and not checklist_present
         ):
             return "我理解成你要改这条任务，但还没抓稳具体要改什么。"
 
-        patch = TickTickTaskPatch(
-            id=target_task.id,
-            projectId=target_project_id,
-            title=new_title,
-            desc=updated_description,
-            dueDate=self._format_ticktick_datetime(due_at) if due_at is not None else None,
-            startDate=self._format_ticktick_datetime(start_at) if start_at is not None else None,
-            timeZone=timezone_name if (due_at or start_at) else None,
-            repeatFlag=repeat_rule,
-            priority=priority,
-            items=checklist_items or None,
-            tags=tags or None,
-        )
+        patch_kwargs: dict[str, Any] = {
+            "id": target_task.id,
+            "projectId": target_project_id,
+        }
+        if new_title is not None:
+            patch_kwargs["title"] = new_title
+        if updated_description is not None:
+            patch_kwargs["desc"] = updated_description
+        if due_at is not None:
+            patch_kwargs["dueDate"] = self._format_ticktick_datetime(due_at)
+        if start_at is not None:
+            patch_kwargs["startDate"] = self._format_ticktick_datetime(start_at)
+        if due_at is not None or start_at is not None:
+            patch_kwargs["timeZone"] = timezone_name
+        if repeat_rule_present:
+            patch_kwargs["repeatFlag"] = repeat_rule if repeat_rule is not None else ""
+        if priority_present and priority is not None:
+            patch_kwargs["priority"] = priority
+        if checklist_present:
+            patch_kwargs["items"] = checklist_items
+        if tags_present:
+            patch_kwargs["tags"] = tags
+
+        patch = TickTickTaskPatch(**patch_kwargs)
         await self._ticktick_client.update_task(
             access_token=access_token,
             task_id=target_task.id,
@@ -344,24 +415,82 @@ class TaskCommandService:
                 shadow = TaskShadow(
                     user_id=user_id,
                     ticktick_task_id=target_task.id,
-                    semantic_type=semantic_type or ("explicit_time" if due_at else "memo"),
+                    semantic_type=effective_semantic_type or ("explicit_time" if due_at else "memo"),
                 )
                 TaskShadowRepository(session).add(shadow)
             if semantic_type is not None:
                 shadow.semantic_type = semantic_type
             elif due_at is not None or start_at is not None:
                 shadow.semantic_type = "explicit_time"
+            elif window_start is not None or window_end is not None:
+                shadow.semantic_type = "windowed"
+            elif shadow.semantic_type not in {"explicit_time", "windowed"} and existing_shadow is not None:
+                shadow.semantic_type = existing_shadow.semantic_type
             shadow.normalized_title = new_title or target_task.title
             shadow.list_name = target_list_name or shadow.list_name
-            shadow.tags_json = tags or shadow.tags_json
-            shadow.due_at = due_at or shadow.due_at
-            shadow.start_at = start_at or shadow.start_at
-            shadow.end_at = end_at or shadow.end_at
+            if tags_present:
+                shadow.tags_json = tags
+            elif shadow.tags_json is None and existing_shadow is not None:
+                shadow.tags_json = existing_shadow.tags_json
             if shadow.semantic_type == "explicit_time":
+                if due_at is not None:
+                    shadow.due_at = due_at
+                elif existing_shadow is not None and existing_shadow.semantic_type == "explicit_time":
+                    shadow.due_at = existing_shadow.due_at
+                if start_at is not None:
+                    shadow.start_at = start_at
+                elif existing_shadow is not None and existing_shadow.semantic_type == "explicit_time":
+                    shadow.start_at = existing_shadow.start_at
+                if end_at is not None:
+                    shadow.end_at = end_at
+                elif existing_shadow is not None and existing_shadow.semantic_type == "explicit_time":
+                    shadow.end_at = existing_shadow.end_at
                 shadow.window_start = None
                 shadow.window_end = None
-            shadow.raw_nl_time = raw_nl_time or shadow.raw_nl_time
-            shadow.timezone_mode = "fixed" if (due_at or start_at) else shadow.timezone_mode
+                shadow.raw_nl_time = None
+                shadow.timezone_mode = "fixed"
+            elif shadow.semantic_type == "windowed":
+                shadow.due_at = None
+                shadow.start_at = None
+                shadow.end_at = None
+                if window_start_present:
+                    shadow.window_start = window_start
+                elif existing_shadow is not None and existing_shadow.semantic_type == "windowed":
+                    shadow.window_start = existing_shadow.window_start
+                else:
+                    shadow.window_start = None
+                if window_end_present:
+                    shadow.window_end = window_end
+                elif existing_shadow is not None and existing_shadow.semantic_type == "windowed":
+                    shadow.window_end = existing_shadow.window_end
+                else:
+                    shadow.window_end = None
+                if raw_nl_time_present:
+                    shadow.raw_nl_time = raw_nl_time
+                elif existing_shadow is not None and existing_shadow.semantic_type == "windowed":
+                    shadow.raw_nl_time = existing_shadow.raw_nl_time
+                else:
+                    shadow.raw_nl_time = None
+                shadow.timezone_mode = "floating"
+            else:
+                if due_at is not None:
+                    shadow.due_at = due_at
+                elif existing_shadow is not None:
+                    shadow.due_at = existing_shadow.due_at
+                if start_at is not None:
+                    shadow.start_at = start_at
+                elif existing_shadow is not None:
+                    shadow.start_at = existing_shadow.start_at
+                if end_at is not None:
+                    shadow.end_at = end_at
+                elif existing_shadow is not None:
+                    shadow.end_at = existing_shadow.end_at
+                if raw_nl_time_present:
+                    shadow.raw_nl_time = raw_nl_time
+                elif existing_shadow is not None:
+                    shadow.raw_nl_time = existing_shadow.raw_nl_time
+                if semantic_type is None and existing_shadow is not None:
+                    shadow.timezone_mode = existing_shadow.timezone_mode
             shadow.last_synced_at = datetime.now(timezone.utc)
             session.commit()
 
@@ -373,8 +502,11 @@ class TaskCommandService:
             moved_list_name=target_list_name,
             notes=self._build_advanced_field_notes(
                 repeat_rule=repeat_rule,
-                tags=tags,
-                checklist_items=checklist_items,
+                tags=tags if tags_present else [],
+                checklist_items=checklist_items if checklist_present else [],
+                repeat_rule_cleared=repeat_rule_present and (repeat_rule == ""),
+                tags_cleared=tags_present and not tags,
+                checklist_cleared=checklist_present and not checklist_items,
             ),
         )
 
@@ -473,6 +605,26 @@ class TaskCommandService:
             if text and text not in tags:
                 tags.append(text)
         return tags
+
+    def _resolve_repeat_rule_update(self, payload: dict[str, Any]) -> Optional[str]:
+        raw_value: Optional[object]
+        if "repeat_rule" in payload:
+            raw_value = payload.get("repeat_rule")
+        else:
+            raw_value = payload.get("repeatFlag")
+        cleaned = self._clean_optional_text(raw_value)
+        if cleaned is None:
+            return ""
+        lowered = cleaned.casefold()
+        if lowered in {"none", "null", "no repeat", "not repeat", "no-repeat", "取消循环", "不重复"}:
+            return ""
+        return self._normalize_repeat_rule(cleaned)
+
+    def _sync_window_description(self, description: str, raw_nl_time: Optional[str]) -> str:
+        lines = [line for line in description.splitlines() if not line.startswith("时间窗口：")]
+        if raw_nl_time:
+            lines.append(f"时间窗口：{raw_nl_time}")
+        return "\n".join(lines).strip()
 
     def _normalize_repeat_rule(self, value: Optional[object]) -> Optional[str]:
         cleaned = self._clean_optional_text(value)
@@ -594,13 +746,22 @@ class TaskCommandService:
         repeat_rule: Optional[str],
         tags: list[str],
         checklist_items: list[TickTickChecklistItem],
+        repeat_rule_cleared: bool = False,
+        tags_cleared: bool = False,
+        checklist_cleared: bool = False,
     ) -> list[str]:
         notes: list[str] = []
-        if repeat_rule:
+        if repeat_rule_cleared:
+            notes.append("重复规则已清除")
+        elif repeat_rule:
             notes.append(f"重复规则已设置为 {repeat_rule}")
-        if tags:
+        if tags_cleared:
+            notes.append("标签已清空")
+        elif tags:
             notes.append("已尝试同步标签，若 TickTick 侧未显示则说明该字段当前接口不稳定")
-        if checklist_items:
+        if checklist_cleared:
+            notes.append("清单已清空")
+        elif checklist_items:
             notes.append(f"已附带 {len(checklist_items)} 条清单")
         return notes
 

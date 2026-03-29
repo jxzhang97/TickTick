@@ -51,6 +51,108 @@ class MemoryService:
             session.commit()
             return fact
 
+    def record_alias_mapping(
+        self,
+        *,
+        user_id: int,
+        alias: str,
+        canonical_name: str,
+        kind: str | None = None,
+        confidence: float = 1.0,
+        source_type: str | None = None,
+        last_confirmed_at: datetime | None = None,
+    ) -> MemoryFact | None:
+        cleaned_alias = alias.strip()
+        cleaned_canonical_name = canonical_name.strip()
+        if not cleaned_alias or not cleaned_canonical_name:
+            return None
+        value_json: dict = {"canonical_name": cleaned_canonical_name}
+        if kind:
+            value_json["kind"] = kind
+        return self.upsert_fact(
+            user_id=user_id,
+            key=cleaned_alias,
+            value_json=value_json,
+            memory_type=MemoryType.ALIAS_MAPPING,
+            confidence=confidence,
+            source_type=source_type,
+            last_confirmed_at=last_confirmed_at or datetime.now(timezone.utc),
+        )
+
+    def record_time_expression(
+        self,
+        *,
+        user_id: int,
+        raw_nl_time: str,
+        resolved_due_at: datetime | None = None,
+        resolved_window_start: datetime | None = None,
+        resolved_window_end: datetime | None = None,
+        semantic_type: str | None = None,
+        confidence: float = 1.0,
+        source_type: str | None = None,
+        last_confirmed_at: datetime | None = None,
+    ) -> MemoryFact | None:
+        cleaned_raw_nl_time = raw_nl_time.strip()
+        if not cleaned_raw_nl_time:
+            return None
+        if resolved_due_at is None and resolved_window_start is None and resolved_window_end is None:
+            return None
+        value_json: dict = {"raw_nl_time": cleaned_raw_nl_time}
+        if resolved_due_at is not None:
+            value_json["resolved_due_at"] = resolved_due_at.isoformat()
+        if resolved_window_start is not None:
+            value_json["resolved_window_start"] = resolved_window_start.isoformat()
+        if resolved_window_end is not None:
+            value_json["resolved_window_end"] = resolved_window_end.isoformat()
+        if semantic_type:
+            value_json["semantic_type"] = semantic_type
+        return self.upsert_fact(
+            user_id=user_id,
+            key=cleaned_raw_nl_time,
+            value_json=value_json,
+            memory_type=MemoryType.TIME_EXPRESSION,
+            confidence=confidence,
+            source_type=source_type,
+            last_confirmed_at=last_confirmed_at or datetime.now(timezone.utc),
+        )
+
+    def record_disambiguation_pattern(
+        self,
+        *,
+        user_id: int,
+        key: str,
+        selected_title: str,
+        selected_task_id: str | None = None,
+        selected_when: str | None = None,
+        candidate_titles: list[str] | None = None,
+        selection_index: int | None = None,
+        confidence: float = 1.0,
+        source_type: str | None = None,
+        last_confirmed_at: datetime | None = None,
+    ) -> MemoryFact | None:
+        cleaned_key = key.strip()
+        cleaned_selected_title = selected_title.strip()
+        if not cleaned_key or not cleaned_selected_title:
+            return None
+        value_json: dict = {"selected_title": cleaned_selected_title}
+        if selected_task_id:
+            value_json["selected_task_id"] = selected_task_id
+        if selected_when:
+            value_json["selected_when"] = selected_when
+        if candidate_titles:
+            value_json["candidate_titles"] = candidate_titles
+        if selection_index is not None:
+            value_json["selection_index"] = selection_index
+        return self.upsert_fact(
+            user_id=user_id,
+            key=cleaned_key,
+            value_json=value_json,
+            memory_type=MemoryType.DISAMBIGUATION_PATTERN,
+            confidence=confidence,
+            source_type=source_type,
+            last_confirmed_at=last_confirmed_at or datetime.now(timezone.utc),
+        )
+
     def get_relevant_memory_items(
         self,
         *,
@@ -164,11 +266,11 @@ class MemoryService:
 
     def _rank_key(self, *, query: str, fact: MemoryFact) -> tuple[int, int, datetime]:
         type_priority = {
-            MemoryType.ALIAS_MAPPING.value: 3,
+            MemoryType.ALIAS_MAPPING.value: 4,
+            MemoryType.DISAMBIGUATION_PATTERN.value: 3,
             MemoryType.TIME_EXPRESSION.value: 2,
             MemoryType.PREFERENCE.value: 1,
             MemoryType.STYLE_PREFERENCE.value: 1,
-            MemoryType.DISAMBIGUATION_PATTERN.value: 0,
         }.get(fact.memory_type, 0)
         confirmed_at = fact.last_confirmed_at or datetime.min.replace(tzinfo=timezone.utc)
         if confirmed_at.tzinfo is None:
@@ -177,12 +279,36 @@ class MemoryService:
 
     def _render_fact(self, fact: MemoryFact) -> str:
         if fact.memory_type == MemoryType.ALIAS_MAPPING.value:
-            return f"alias_mapping: {fact.key} -> {self._value_text(fact, preferred_keys=('canonical_name', 'value', 'target'))}"
+            kind = self._clean_optional_text(fact.value_json.get("kind"))
+            prefix = f"alias_mapping[{kind}]" if kind else "alias_mapping"
+            return f"{prefix}: {fact.key} -> {self._value_text(fact, preferred_keys=('canonical_name', 'value', 'target'))}"
         if fact.memory_type == MemoryType.TIME_EXPRESSION.value:
+            resolved_due_at = self._clean_optional_text(fact.value_json.get("resolved_due_at"))
+            resolved_window_start = self._clean_optional_text(fact.value_json.get("resolved_window_start"))
+            resolved_window_end = self._clean_optional_text(fact.value_json.get("resolved_window_end"))
+            if resolved_due_at:
+                return f"time_expression: {fact.key} -> due_at={resolved_due_at}"
+            if resolved_window_start or resolved_window_end:
+                window_bits = " ~ ".join(bit for bit in (resolved_window_start, resolved_window_end) if bit)
+                return f"time_expression: {fact.key} -> window={window_bits}"
             return f"time_expression: {fact.key} -> {self._value_text(fact, preferred_keys=('normalized', 'value', 'resolved'))}"
+        if fact.memory_type == MemoryType.DISAMBIGUATION_PATTERN.value:
+            selected_when = self._clean_optional_text(fact.value_json.get("selected_when"))
+            selected_title = self._value_text(
+                fact,
+                preferred_keys=("selected_title", "canonical_name", "value", "target"),
+            )
+            suffix = f" ({selected_when})" if selected_when else ""
+            return f"disambiguation_pattern: {fact.key} -> {selected_title}{suffix}"
         if fact.memory_type == MemoryType.PREFERENCE.value or fact.memory_type == MemoryType.STYLE_PREFERENCE.value:
             return f"{fact.memory_type}: {fact.key} = {self._value_text(fact, preferred_keys=('value', 'preference', 'style'))}"
         return f"{fact.memory_type}: {fact.key} = {json.dumps(fact.value_json, ensure_ascii=False, sort_keys=True)}"
+
+    def _clean_optional_text(self, value: object | None) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
 
     def _value_text(self, fact: MemoryFact, *, preferred_keys: tuple[str, ...]) -> str:
         for key in preferred_keys:

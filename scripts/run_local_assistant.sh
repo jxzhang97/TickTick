@@ -37,10 +37,27 @@ fi
   >> logs/api.stdout.log 2>> logs/api.stderr.log &
 API_PID=$!
 
+.venv/bin/python -m ticktick_telegram_assistant.runner \
+  >> logs/runner.stdout.log 2>> logs/runner.stderr.log &
+RUNNER_PID=$!
+
 cleanup() {
+  kill "$RUNNER_PID" >/dev/null 2>&1 || true
   kill "$API_PID" >/dev/null 2>&1 || true
 }
 
 trap cleanup EXIT INT TERM
 
-.venv/bin/python -m ticktick_telegram_assistant.runner
+while true; do
+  if ! kill -0 "$API_PID" >/dev/null 2>&1; then
+    wait "$API_PID" >/dev/null 2>&1 || true
+    echo "API process exited unexpectedly." >&2
+    exit 1
+  fi
+  if ! kill -0 "$RUNNER_PID" >/dev/null 2>&1; then
+    wait "$RUNNER_PID" >/dev/null 2>&1 || true
+    echo "Runner process exited unexpectedly." >&2
+    exit 1
+  fi
+  sleep 2
+done

@@ -529,6 +529,164 @@ async def test_execute_action_updates_repeat_rule_tags_and_checklist() -> None:
 
 
 @pytest.mark.asyncio
+async def test_execute_action_can_clear_repeat_tags_and_checklist() -> None:
+    from ticktick_telegram_assistant.services.task_command_service import TaskCommandService
+
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        user = User(
+            telegram_user_id="99",
+            display_name="Jiaxin",
+            current_timezone="America/Los_Angeles",
+            ticktick_access_token="access-token",
+        )
+        session.add(user)
+        session.flush()
+        session.add(
+            TaskShadow(
+                user_id=user.id,
+                ticktick_task_id="task-1",
+                semantic_type="explicit_time",
+                normalized_title="weekly sync",
+                tags_json=["old"],
+            )
+        )
+        session.commit()
+
+    client = FakeTickTickClient()
+    client.tasks = [
+        TickTickTask(
+            id="task-1",
+            projectId="telegram-inbox",
+            title="weekly sync",
+            desc="原说明",
+            status=0,
+        )
+    ]
+    service = TaskCommandService(session_factory=session_factory, ticktick_client=client)
+
+    reply = await service.execute_action(
+        telegram_user_id="99",
+        action=PlannedAction(
+            action_type="update_task",
+            payload={
+                "match_title": "weekly sync",
+                "repeat_rule": "取消循环",
+                "tags": [],
+                "subtasks": [],
+            },
+        ),
+    )
+
+    assert "重复规则已清除" in reply
+    assert "标签已清空" in reply
+    assert "清单已清空" in reply
+    assert client.calls == [
+        {"method": "list_tasks", "access_token": "access-token", "since": None},
+        {
+            "method": "update_task",
+            "access_token": "access-token",
+            "task_id": "task-1",
+            "patch": {
+                "id": "task-1",
+                "projectId": "telegram-inbox",
+                "repeatFlag": "",
+                "items": [],
+                "tags": [],
+            },
+        },
+    ]
+
+    with session_factory() as session:
+        shadow = session.query(TaskShadow).one()
+        assert shadow.tags_json == []
+
+
+@pytest.mark.asyncio
+async def test_execute_action_updates_windowed_task_and_replaces_old_window_metadata() -> None:
+    from ticktick_telegram_assistant.services.task_command_service import TaskCommandService
+
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        user = User(
+            telegram_user_id="99",
+            display_name="Jiaxin",
+            current_timezone="America/Los_Angeles",
+            ticktick_access_token="access-token",
+        )
+        session.add(user)
+        session.flush()
+        session.add(
+            TaskShadow(
+                user_id=user.id,
+                ticktick_task_id="task-1",
+                semantic_type="windowed",
+                normalized_title="把周报框架补完",
+                window_start=datetime.fromisoformat("2026-03-30T00:00:00-07:00").replace(tzinfo=None),
+                window_end=datetime.fromisoformat("2026-04-05T23:59:00-07:00").replace(tzinfo=None),
+                raw_nl_time="上周",
+                due_at=datetime.fromisoformat("2026-03-28T09:00:00-07:00").replace(tzinfo=None),
+                start_at=datetime.fromisoformat("2026-03-28T08:00:00-07:00").replace(tzinfo=None),
+                end_at=datetime.fromisoformat("2026-03-28T10:00:00-07:00").replace(tzinfo=None),
+                timezone_mode="floating",
+            )
+        )
+        session.commit()
+
+    client = FakeTickTickClient()
+    client.tasks = [
+        TickTickTask(
+            id="task-1",
+            projectId="telegram-inbox",
+            title="把周报框架补完",
+            desc="先整理材料\n时间窗口：上周",
+            status=0,
+        )
+    ]
+    service = TaskCommandService(session_factory=session_factory, ticktick_client=client)
+
+    reply = await service.execute_action(
+        telegram_user_id="99",
+        action=PlannedAction(
+            action_type="update_task",
+            payload={
+                "match_title": "把周报框架补完",
+                "semantic_type": "windowed",
+                "window_start": "2026-04-06T00:00:00-07:00",
+                "window_end": "2026-04-12T23:59:00-07:00",
+                "raw_nl_time": "下周",
+            },
+        ),
+    )
+
+    assert "说明已更新" in reply
+    assert client.calls == [
+        {"method": "list_tasks", "access_token": "access-token", "since": None},
+        {
+            "method": "update_task",
+            "access_token": "access-token",
+            "task_id": "task-1",
+            "patch": {
+                "id": "task-1",
+                "projectId": "telegram-inbox",
+                "desc": "先整理材料\n时间窗口：下周",
+            },
+        },
+    ]
+
+    with session_factory() as session:
+        shadow = session.query(TaskShadow).one()
+        assert shadow.semantic_type == "windowed"
+        assert shadow.window_start == datetime.fromisoformat("2026-04-06T00:00:00-07:00").replace(tzinfo=None)
+        assert shadow.window_end == datetime.fromisoformat("2026-04-12T23:59:00-07:00").replace(tzinfo=None)
+        assert shadow.raw_nl_time == "下周"
+        assert shadow.due_at is None
+        assert shadow.start_at is None
+        assert shadow.end_at is None
+        assert shadow.timezone_mode == "floating"
+
+
+@pytest.mark.asyncio
 async def test_execute_action_updates_task_time_span_and_repeat_phrase() -> None:
     from ticktick_telegram_assistant.services.task_command_service import TaskCommandService
 
