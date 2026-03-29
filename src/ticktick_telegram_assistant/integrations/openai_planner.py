@@ -19,10 +19,13 @@ class OpenAIPlanner:
         if self._client is None:
             return PlannedConversation()
 
-        response = await self._client.responses.create(
-            model=self._model,
-            input=self._build_prompt(context),
-        )
+        try:
+            response = await self._client.responses.create(
+                model=self._model,
+                input=self._build_prompt(context),
+            )
+        except Exception:
+            return PlannedConversation()
         try:
             return PlannedConversation.model_validate_json(self._extract_json(response.output_text))
         except ValidationError:

@@ -24,3 +24,27 @@ def test_snooze_understands_tonight_phrase() -> None:
     )
     assert event["scheduled_at"].startswith("2026-03-17T20:00")
     assert event["task_due_at"] == "2026-03-17T18:10:00-06:00"
+
+
+def test_snooze_understands_tomorrow_morning_phrase() -> None:
+    event = ReminderService().build_snooze_event(
+        task={
+            "id": "t1",
+            "scheduled_at": "2026-03-17T18:10:00-06:00",
+        },
+        request_text="明天早上8点再提醒我",
+    )
+    assert event["scheduled_at"].startswith("2026-03-18T08:00")
+    assert event["task_due_at"] == "2026-03-17T18:10:00-06:00"
+
+
+def test_snooze_understands_day_after_noon_phrase() -> None:
+    event = ReminderService().build_snooze_event(
+        task={
+            "id": "t1",
+            "scheduled_at": "2026-03-17T09:10:00-06:00",
+        },
+        request_text="后天中午再提醒",
+    )
+    assert event["scheduled_at"].startswith("2026-03-19T12:00")
+    assert event["task_due_at"] == "2026-03-17T09:10:00-06:00"

@@ -12,18 +12,21 @@ class FakeResponse:
 
 
 class FakeResponsesAPI:
-    def __init__(self, output_text: str) -> None:
+    def __init__(self, output_text: str, *, error: Exception | None = None) -> None:
         self._output_text = output_text
+        self._error = error
         self.calls: list[dict] = []
 
     async def create(self, **kwargs):
         self.calls.append(kwargs)
+        if self._error is not None:
+            raise self._error
         return FakeResponse(self._output_text)
 
 
 class FakeOpenAIClient:
-    def __init__(self, output_text: str) -> None:
-        self.responses = FakeResponsesAPI(output_text)
+    def __init__(self, output_text: str, *, error: Exception | None = None) -> None:
+        self.responses = FakeResponsesAPI(output_text, error=error)
 
 
 @pytest.mark.asyncio
@@ -87,6 +90,22 @@ async def test_plan_returns_structured_actions_from_json_response() -> None:
 @pytest.mark.asyncio
 async def test_plan_returns_empty_plan_when_model_output_is_invalid() -> None:
     planner = OpenAIPlanner(client=FakeOpenAIClient("not json"))
+
+    planned = await planner.plan(
+        ConversationContext(
+            user_text="随便说一句",
+            current_timezone="America/Los_Angeles",
+            current_local_time="2026-03-27T09:00:00-07:00",
+        )
+    )
+
+    assert planned.actions == []
+    assert planned.assistant_reply is None
+
+
+@pytest.mark.asyncio
+async def test_plan_returns_empty_plan_when_openai_client_raises() -> None:
+    planner = OpenAIPlanner(client=FakeOpenAIClient("", error=RuntimeError("boom")))
 
     planned = await planner.plan(
         ConversationContext(
