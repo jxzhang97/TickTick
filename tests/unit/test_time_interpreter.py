@@ -58,3 +58,12 @@ def test_interpreter_marks_tonight_exact_times() -> None:
     )
     assert result.semantic_type == "explicit_time"
     assert result.due_at.isoformat().startswith("2026-03-16T20:00")
+
+
+def test_interpreter_marks_month_day_deadlines_as_explicit_time() -> None:
+    result = TimeInterpreter().parse(
+        "改到4月3号",
+        now=datetime.fromisoformat("2026-03-29T09:00:00-07:00"),
+    )
+    assert result.semantic_type == "explicit_time"
+    assert result.due_at.isoformat().startswith("2026-04-03T23:59")

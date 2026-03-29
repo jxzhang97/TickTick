@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import re
+from zoneinfo import ZoneInfo
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
@@ -17,6 +18,7 @@ from ticktick_telegram_assistant.domain.schemas import (
     PlannedAction,
     PlannedConversation,
     PlannedQueryIntent,
+    PlannedTaskWriteIntent,
     TelegramReply,
 )
 from ticktick_telegram_assistant.integrations.openai_planner import OpenAIPlanner
@@ -30,6 +32,8 @@ from ticktick_telegram_assistant.services.evening_review_service import EveningR
 from ticktick_telegram_assistant.services.memory_service import MemoryService
 from ticktick_telegram_assistant.services.message_renderer import MessageRenderer
 from ticktick_telegram_assistant.services.reminder_service import ReminderService
+from ticktick_telegram_assistant.services.task_command_service import TaskCommandExecutionCache
+from ticktick_telegram_assistant.services.time_interpreter import TimeInterpreter
 from ticktick_telegram_assistant.services.timezone_resolver import TimezoneResolver
 
 
@@ -126,6 +130,7 @@ class ConversationService:
         *,
         skip_pending_contexts: bool = False,
         skip_multiline_batch: bool = False,
+        execution_cache: TaskCommandExecutionCache | None = None,
         trace: dict[str, object] | None = None,
     ) -> list[TelegramReply]:
         if update.message is None:
@@ -200,6 +205,13 @@ class ConversationService:
             current_timezone=current_timezone,
         )
         planned = await self._planner.plan(context)
+        if self._planned_conversation_is_empty(planned):
+            fallback_planned = self._maybe_build_rule_based_task_write(
+                text=resolved_text,
+                current_timezone=current_timezone,
+            )
+            if fallback_planned is not None:
+                planned = fallback_planned
         if trace is not None:
             trace["parsed_plan_json"] = planned.model_dump(mode="json")
         query_reply = await self._maybe_execute_planned_query(
@@ -215,6 +227,7 @@ class ConversationService:
             planned=planned,
             telegram_user_id=telegram_user_id,
             context=context,
+            execution_cache=execution_cache,
             trace=trace,
         )
         if action_reply is not None:
@@ -494,6 +507,7 @@ class ConversationService:
         planned: PlannedConversation,
         telegram_user_id: str | None,
         context: ConversationContext,
+        execution_cache: TaskCommandExecutionCache | None = None,
         allow_non_ticktick_request: bool = False,
         trace: dict[str, object] | None = None,
     ) -> TelegramReply | None:
@@ -537,6 +551,7 @@ class ConversationService:
         confirmation_text = await self._maybe_request_write_confirmation(
             telegram_user_id=telegram_user_id,
             action=action,
+            execution_cache=execution_cache,
         )
         if confirmation_text is not None:
             return TelegramReply(chat_id=update.message.chat.id, text=confirmation_text)
@@ -544,6 +559,7 @@ class ConversationService:
         reply_text = await self._task_command_service.execute_action(
             telegram_user_id=telegram_user_id,
             action=action,
+            execution_cache=execution_cache,
         )
         self._store_active_task_context(telegram_user_id=telegram_user_id, action=action)
         if trace is not None:
@@ -666,6 +682,7 @@ class ConversationService:
         existing_batch_context = self._load_pending_batch_context(telegram_user_id=telegram_user_id)
         reply_texts: list[str] = []
         pending_batch_entries: list[dict] = list(existing_batch_context.get("entries") or []) if existing_batch_context else []
+        execution_cache = TaskCommandExecutionCache()
         for line in lines:
             line_update = update.model_copy(
                 deep=True,
@@ -681,6 +698,7 @@ class ConversationService:
                     line_update,
                     skip_pending_contexts=True,
                     skip_multiline_batch=True,
+                    execution_cache=execution_cache,
                 )
             except Exception as exc:
                 batch_error_reply = self._build_ticktick_batch_error_text(exc=exc)
@@ -721,6 +739,96 @@ class ConversationService:
 
         combined_text = "\n".join(reply_texts)
         return [TelegramReply(chat_id=update.message.chat.id, text=combined_text)]
+
+    def _planned_conversation_is_empty(self, planned: PlannedConversation) -> bool:
+        return (
+            planned.intent_type is None
+            and planned.query is None
+            and planned.reminder_control is None
+            and planned.clarification is None
+            and planned.task_write is None
+            and not planned.actions
+            and not planned.requires_confirmation
+            and planned.assistant_reply is None
+        )
+
+    def _maybe_build_rule_based_task_write(
+        self,
+        *,
+        text: str,
+        current_timezone: str,
+    ) -> PlannedConversation | None:
+        complete_match = re.fullmatch(r"(?P<title>.+?)(?:完成了|做完了|已完成|已做完|勾掉了?)", text.strip())
+        if complete_match is not None:
+            title = self._sanitize_rule_based_title(complete_match.group("title"))
+            if title:
+                return PlannedConversation(
+                    intent_type="task_write",
+                    task_write=PlannedTaskWriteIntent(
+                        write_type="complete",
+                        target_title=title,
+                        summary=f"完成任务：{title}",
+                    ),
+                    actions=[
+                        PlannedAction(
+                            action_type="complete_task",
+                            payload={"title": title},
+                        )
+                    ],
+                )
+
+        update_match = re.fullmatch(r"(?P<title>.+?)改到(?P<when>.+)", text.strip())
+        if update_match is not None:
+            title = self._sanitize_rule_based_title(update_match.group("title"))
+            raw_time = self._clean_optional_text(update_match.group("when"))
+            parsed_time = self._parse_rule_based_time(raw_time=raw_time, current_timezone=current_timezone)
+            if title and raw_time and parsed_time is not None:
+                payload: dict[str, object] = {
+                    "match_title": title,
+                    "semantic_type": parsed_time.semantic_type,
+                    "raw_nl_time": raw_time,
+                }
+                if parsed_time.semantic_type == "explicit_time" and parsed_time.due_at is not None:
+                    payload["due_at"] = parsed_time.due_at.isoformat()
+                elif parsed_time.semantic_type == "windowed":
+                    if parsed_time.window_start is not None:
+                        payload["window_start"] = parsed_time.window_start.isoformat()
+                    if parsed_time.window_end is not None:
+                        payload["window_end"] = parsed_time.window_end.isoformat()
+                return PlannedConversation(
+                    intent_type="task_write",
+                    task_write=PlannedTaskWriteIntent(
+                        write_type="update",
+                        target_title=title,
+                        summary=f"更新时间：{title}",
+                    ),
+                    actions=[
+                        PlannedAction(
+                            action_type="update_task",
+                            payload=payload,
+                        )
+                    ],
+                )
+        return None
+
+    def _sanitize_rule_based_title(self, text: str | None) -> str | None:
+        cleaned = self._clean_optional_text(text)
+        if cleaned is None:
+            return None
+        cleaned = cleaned.strip("“”\"'` ")
+        return cleaned or None
+
+    def _parse_rule_based_time(self, *, raw_time: str | None, current_timezone: str):
+        if raw_time is None:
+            return None
+        try:
+            now = datetime.now(ZoneInfo(current_timezone))
+        except Exception:
+            now = datetime.now().astimezone()
+        parsed = TimeInterpreter().parse(raw_time, now=now)
+        if parsed.semantic_type == "memo":
+            return None
+        return parsed
 
     def _maybe_handle_pasted_assistant_transcript(
         self,
@@ -1441,7 +1549,13 @@ class ConversationService:
             )
         return None
 
-    async def _maybe_request_write_confirmation(self, *, telegram_user_id: str, action: PlannedAction) -> str | None:
+    async def _maybe_request_write_confirmation(
+        self,
+        *,
+        telegram_user_id: str,
+        action: PlannedAction,
+        execution_cache: TaskCommandExecutionCache | None = None,
+    ) -> str | None:
         if self._session_factory is None or self._ticktick_client is None:
             return None
         user = self._get_user_by_telegram_user_id(telegram_user_id)
@@ -1450,7 +1564,12 @@ class ConversationService:
         if action.action_type not in {"create_task", "update_task", "complete_task"}:
             return None
 
-        tasks = await self._ticktick_client.list_tasks(access_token=user.ticktick_access_token, since=None)
+        if execution_cache is not None and execution_cache.tasks is not None:
+            tasks = execution_cache.tasks
+        else:
+            tasks = await self._ticktick_client.list_tasks(access_token=user.ticktick_access_token, since=None)
+            if execution_cache is not None:
+                execution_cache.tasks = list(tasks)
         title = self._proposed_title(action) if action.action_type == "update_task" else self._action_title(action)
         target_lookup_title = self._target_lookup_title(action)
         start_at = self._coerce_datetime(action.payload.get("start_at"))

@@ -144,6 +144,84 @@ async def test_execute_action_creates_explicit_time_task_and_shadow() -> None:
 
 
 @pytest.mark.asyncio
+async def test_execute_action_reuses_cached_tasks_across_batch_updates() -> None:
+    from ticktick_telegram_assistant.services.task_command_service import (
+        TaskCommandExecutionCache,
+        TaskCommandService,
+    )
+
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        session.add(
+            User(
+                telegram_user_id="99",
+                display_name="Jiaxin",
+                current_timezone="America/Los_Angeles",
+                ticktick_access_token="access-token",
+            )
+        )
+        session.commit()
+
+    client = FakeTickTickClient()
+    client.tasks = [
+        TickTickTask(
+            id="task-1",
+            projectId="telegram-inbox",
+            title="和家里打电话",
+            status=0,
+        ),
+        TickTickTask(
+            id="task-2",
+            projectId="telegram-inbox",
+            title="处理ds2019的事情",
+            status=0,
+        ),
+    ]
+    service = TaskCommandService(session_factory=session_factory, ticktick_client=client)
+    cache = TaskCommandExecutionCache()
+
+    complete_reply = await service.execute_action(
+        telegram_user_id="99",
+        action=PlannedAction(action_type="complete_task", payload={"title": "和家里打电话"}),
+        execution_cache=cache,
+    )
+    update_reply = await service.execute_action(
+        telegram_user_id="99",
+        action=PlannedAction(
+            action_type="update_task",
+            payload={
+                "match_title": "处理ds2019的事情",
+                "due_at": "2026-03-29T22:00:00-07:00",
+            },
+        ),
+        execution_cache=cache,
+    )
+
+    assert "和家里打电话" in complete_reply
+    assert "处理ds2019的事情" in update_reply
+    assert client.calls == [
+        {"method": "list_tasks", "access_token": "access-token", "since": None},
+        {
+            "method": "complete_task",
+            "access_token": "access-token",
+            "project_id": "telegram-inbox",
+            "task_id": "task-1",
+        },
+        {
+            "method": "update_task",
+            "access_token": "access-token",
+            "task_id": "task-2",
+            "patch": {
+                "id": "task-2",
+                "projectId": "telegram-inbox",
+                "dueDate": "2026-03-29T22:00:00-0700",
+                "timeZone": "America/Los_Angeles",
+            },
+        },
+    ]
+
+
+@pytest.mark.asyncio
 async def test_execute_action_creates_task_with_repeat_priority_tags_and_checklist() -> None:
     from ticktick_telegram_assistant.services.task_command_service import TaskCommandService
 

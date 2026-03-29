@@ -27,7 +27,7 @@ class TimeInterpreter:
             text,
         )
         if match is None:
-            return None
+            return self._parse_month_day(text, now=now)
 
         day_token = match.group("day")
         day_offset = {"今天": 0, "今晚": 0, "明天": 1, "后天": 2}[day_token]
@@ -44,6 +44,36 @@ class TimeInterpreter:
             hour += 12
 
         due_at = datetime.combine(base_date, time(hour=hour, minute=minute), tzinfo=now.tzinfo)
+        return ParsedTimeIntent(semantic_type="explicit_time", due_at=due_at, raw_text=text)
+
+    def _parse_month_day(self, text: str, *, now: datetime) -> ParsedTimeIntent | None:
+        match = re.search(
+            r"(?P<month>\d{1,2})月(?P<day>\d{1,2})(?:号|日)(?:(?P<meridiem>上午|中午|下午|晚上)?(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?点)?",
+            text,
+        )
+        if match is None:
+            return None
+
+        month = int(match.group("month"))
+        day = int(match.group("day"))
+        year = now.year
+        if (month, day) < (now.month, now.day):
+            year += 1
+
+        hour_token = match.group("hour")
+        minute = int(match.group("minute") or 0)
+        if hour_token is None:
+            due_time = time(hour=23, minute=59)
+        else:
+            hour = int(hour_token)
+            meridiem = match.group("meridiem") or ""
+            if meridiem in {"下午", "晚上"} and hour < 12:
+                hour += 12
+            elif meridiem == "中午" and hour < 12:
+                hour = 12 if hour == 0 else hour
+            due_time = time(hour=hour, minute=minute)
+
+        due_at = datetime(year, month, day, due_time.hour, due_time.minute, tzinfo=now.tzinfo)
         return ParsedTimeIntent(semantic_type="explicit_time", due_at=due_at, raw_text=text)
 
     def _parse_windowed_time(self, text: str, *, now: datetime) -> ParsedTimeIntent | None:

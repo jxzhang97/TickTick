@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import re
 from typing import Any, Optional, Union
@@ -20,6 +21,13 @@ from ticktick_telegram_assistant.repositories.users import UserRepository
 from ticktick_telegram_assistant.services.message_renderer import MessageRenderer
 
 
+@dataclass
+class TaskCommandExecutionCache:
+    projects: list[TickTickProject] | None = None
+    tasks: list[TickTickTask] | None = None
+    moved_project_ids: set[str] = field(default_factory=set)
+
+
 class TaskCommandService:
     def __init__(
         self,
@@ -38,16 +46,35 @@ class TaskCommandService:
         telegram_user_id: str,
         action: PlannedAction,
         now: Optional[datetime] = None,
+        execution_cache: TaskCommandExecutionCache | None = None,
     ) -> str:
         if action.action_type == "create_task":
-            return await self._create_task(telegram_user_id=telegram_user_id, action=action)
+            return await self._create_task(
+                telegram_user_id=telegram_user_id,
+                action=action,
+                execution_cache=execution_cache,
+            )
         if action.action_type == "complete_task":
-            return await self._complete_task(telegram_user_id=telegram_user_id, action=action)
+            return await self._complete_task(
+                telegram_user_id=telegram_user_id,
+                action=action,
+                execution_cache=execution_cache,
+            )
         if action.action_type == "update_task":
-            return await self._update_task(telegram_user_id=telegram_user_id, action=action)
+            return await self._update_task(
+                telegram_user_id=telegram_user_id,
+                action=action,
+                execution_cache=execution_cache,
+            )
         return "这一步我还没稳定接好，所以先不冒险替你写入。"
 
-    async def _create_task(self, *, telegram_user_id: str, action: PlannedAction) -> str:
+    async def _create_task(
+        self,
+        *,
+        telegram_user_id: str,
+        action: PlannedAction,
+        execution_cache: TaskCommandExecutionCache | None = None,
+    ) -> str:
         title = str(action.payload.get("title", "")).strip()
         if not title:
             return "这条我还没抓稳标题，所以先不往 TickTick 里写，免得记歪。"
@@ -60,7 +87,10 @@ class TaskCommandService:
             access_token = user.ticktick_access_token
             timezone_name = user.current_timezone
 
-        projects = await self._ticktick_client.list_projects(access_token=access_token)
+        projects = await self._load_projects(
+            access_token=access_token,
+            execution_cache=execution_cache,
+        )
         project = self._select_project(projects=projects, requested_name=action.payload.get("list_name"))
         if project is None:
             return "我暂时没找到一个可写入的 TickTick list，所以这条先没有落下去。"
@@ -105,6 +135,7 @@ class TaskCommandService:
         )
         created = await self._ticktick_client.create_task(access_token=access_token, task=create_payload)
         action.target_task_id = created.id
+        self._remember_created_task(execution_cache=execution_cache, task=created)
 
         with self._session_factory() as session:
             TaskShadowRepository(session).add(
@@ -204,7 +235,13 @@ class TaskCommandService:
             base_reply = f"好，我已经替你记进 TickTick 了：{title}"
         return self._append_notes(base_reply, notes)
 
-    async def _complete_task(self, *, telegram_user_id: str, action: PlannedAction) -> str:
+    async def _complete_task(
+        self,
+        *,
+        telegram_user_id: str,
+        action: PlannedAction,
+        execution_cache: TaskCommandExecutionCache | None = None,
+    ) -> str:
         title = self._clean_optional_text(action.payload.get("title"))
 
         with self._session_factory() as session:
@@ -213,7 +250,10 @@ class TaskCommandService:
                 return "我这边还没连上你的 TickTick，所以现在还不能替你勾完成。"
             access_token = user.ticktick_access_token
 
-        tasks = await self._ticktick_client.list_tasks(access_token=access_token, since=None)
+        tasks = await self._load_tasks(
+            access_token=access_token,
+            execution_cache=execution_cache,
+        )
         match_or_reply = self._resolve_open_task(
             tasks=tasks,
             requested_title=title,
@@ -229,9 +269,16 @@ class TaskCommandService:
             task_id=match_or_reply.id,
         )
         action.target_task_id = match_or_reply.id
+        self._remember_completed_task(execution_cache=execution_cache, task_id=match_or_reply.id)
         return f"好，这条我帮你勾完成了：{match_or_reply.title}"
 
-    async def _update_task(self, *, telegram_user_id: str, action: PlannedAction) -> str:
+    async def _update_task(
+        self,
+        *,
+        telegram_user_id: str,
+        action: PlannedAction,
+        execution_cache: TaskCommandExecutionCache | None = None,
+    ) -> str:
         payload = action.payload
         match_title = self._clean_optional_text(payload.get("match_title"))
 
@@ -243,7 +290,10 @@ class TaskCommandService:
             access_token = user.ticktick_access_token
             timezone_name = user.current_timezone
 
-        tasks = await self._ticktick_client.list_tasks(access_token=access_token, since=None)
+        tasks = await self._load_tasks(
+            access_token=access_token,
+            execution_cache=execution_cache,
+        )
         match_or_reply = self._resolve_open_task(
             tasks=tasks,
             requested_title=match_title,
@@ -258,7 +308,10 @@ class TaskCommandService:
         target_project_id = target_task.projectId
         target_list_name: Optional[str] = None
         if requested_list_name:
-            projects = await self._ticktick_client.list_projects(access_token=access_token)
+            projects = await self._load_projects(
+                access_token=access_token,
+                execution_cache=execution_cache,
+            )
             target_project = self._select_project(projects=projects, requested_name=requested_list_name)
             if target_project is None:
                 return f"我没找到你说的 list：{requested_list_name}"
@@ -404,6 +457,12 @@ class TaskCommandService:
             patch=patch,
         )
         action.target_task_id = target_task.id
+        self._remember_updated_task(
+            execution_cache=execution_cache,
+            original_task=target_task,
+            patch=patch,
+            moved_project_id=target_project_id if target_project_id != target_task.projectId else None,
+        )
 
         with self._session_factory() as session:
             shadow = (
@@ -509,6 +568,91 @@ class TaskCommandService:
                 checklist_cleared=checklist_present and not checklist_items,
             ),
         )
+
+    async def _load_projects(
+        self,
+        *,
+        access_token: str,
+        execution_cache: TaskCommandExecutionCache | None,
+    ) -> list[TickTickProject]:
+        if execution_cache is not None and execution_cache.projects is not None:
+            return execution_cache.projects
+        projects = await self._ticktick_client.list_projects(access_token=access_token)
+        if execution_cache is not None:
+            execution_cache.projects = list(projects)
+        return projects
+
+    async def _load_tasks(
+        self,
+        *,
+        access_token: str,
+        execution_cache: TaskCommandExecutionCache | None,
+    ) -> list[TickTickTask]:
+        if execution_cache is not None and execution_cache.tasks is not None:
+            return execution_cache.tasks
+        tasks = await self._ticktick_client.list_tasks(access_token=access_token, since=None)
+        if execution_cache is not None:
+            execution_cache.tasks = list(tasks)
+        return tasks
+
+    def _remember_created_task(
+        self,
+        *,
+        execution_cache: TaskCommandExecutionCache | None,
+        task: TickTickTask,
+    ) -> None:
+        if execution_cache is None or execution_cache.tasks is None:
+            return
+        execution_cache.tasks.append(task)
+
+    def _remember_completed_task(
+        self,
+        *,
+        execution_cache: TaskCommandExecutionCache | None,
+        task_id: str,
+    ) -> None:
+        if execution_cache is None or execution_cache.tasks is None:
+            return
+        for task in execution_cache.tasks:
+            if task.id == task_id:
+                task.completed = True
+                task.status = 2
+                return
+
+    def _remember_updated_task(
+        self,
+        *,
+        execution_cache: TaskCommandExecutionCache | None,
+        original_task: TickTickTask,
+        patch: TickTickTaskPatch,
+        moved_project_id: str | None,
+    ) -> None:
+        if execution_cache is None or execution_cache.tasks is None:
+            return
+        for task in execution_cache.tasks:
+            if task.id != original_task.id:
+                continue
+            if patch.title is not None:
+                task.title = patch.title
+            if patch.desc is not None:
+                task.desc = patch.desc
+            if patch.startDate is not None:
+                task.startDate = patch.startDate
+            if patch.dueDate is not None:
+                task.dueDate = patch.dueDate
+            if patch.timeZone is not None:
+                task.timeZone = patch.timeZone
+            if patch.repeatFlag is not None:
+                task.repeatFlag = patch.repeatFlag or None
+            if patch.priority is not None:
+                task.priority = patch.priority
+            if patch.items is not None:
+                task.items = list(patch.items)
+            if patch.tags is not None:
+                task.tags = list(patch.tags)
+            if moved_project_id is not None:
+                task.projectId = moved_project_id
+            return
 
     def _resolve_open_task(
         self,

@@ -119,10 +119,10 @@ class FakeTaskCommandService:
         self.created_task_id = created_task_id
         self.calls: list[dict] = []
 
-    async def execute_action(self, *, telegram_user_id: str, action, now=None) -> str:
+    async def execute_action(self, *, telegram_user_id: str, action, now=None, execution_cache=None) -> str:
         if action.action_type == "create_task" and self.created_task_id:
             action.target_task_id = self.created_task_id
-        self.calls.append({"telegram_user_id": telegram_user_id, "action": action, "now": now})
+        self.calls.append({"telegram_user_id": telegram_user_id, "action": action, "now": now, "execution_cache": execution_cache})
         return self.reply_text
 
 
@@ -131,8 +131,8 @@ class SequencedTaskCommandService(FakeTaskCommandService):
         super().__init__(reply_text="")
         self._outcomes = list(outcomes)
 
-    async def execute_action(self, *, telegram_user_id: str, action, now=None) -> str:
-        self.calls.append({"telegram_user_id": telegram_user_id, "action": action, "now": now})
+    async def execute_action(self, *, telegram_user_id: str, action, now=None, execution_cache=None) -> str:
+        self.calls.append({"telegram_user_id": telegram_user_id, "action": action, "now": now, "execution_cache": execution_cache})
         outcome = self._outcomes.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
@@ -282,6 +282,152 @@ async def test_handle_update_returns_today_brief_when_ticktick_connected() -> No
     assert oauth_service.calls == [{"method": "has_connection", "telegram_user_id": "99"}]
     assert len(query_service.calls) == 1
     assert query_service.calls[0]["query"].time_scope == "today"
+
+
+@pytest.mark.asyncio
+async def test_handle_update_rule_based_complete_when_planner_returns_empty() -> None:
+    planner = FakePlanner(PlannedConversation())
+    oauth_service = FakeTickTickOAuthService(connected=True, auth_url=None)
+    task_command_service = FakeTaskCommandService("好，这条我帮你勾完成了：和家里打电话")
+    service = ConversationService(
+        planner=planner,
+        ticktick_oauth_service=oauth_service,
+        task_command_service=task_command_service,
+    )
+    update = TelegramUpdate.model_validate(
+        {
+            "update_id": 4_0_0,
+            "message": {
+                "message_id": 10_0_0,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "和家里打电话完成了",
+            },
+        }
+    )
+
+    replies = await service.handle_update(update)
+
+    assert [reply.text for reply in replies] == ["好，这条我帮你勾完成了：和家里打电话"]
+    assert len(task_command_service.calls) == 1
+    assert task_command_service.calls[0]["action"].action_type == "complete_task"
+    assert task_command_service.calls[0]["action"].payload["title"] == "和家里打电话"
+
+
+@pytest.mark.asyncio
+async def test_handle_update_rule_based_window_update_when_planner_returns_empty() -> None:
+    planner = FakePlanner(PlannedConversation())
+    oauth_service = FakeTickTickOAuthService(connected=True, auth_url=None)
+    task_command_service = FakeTaskCommandService("好，我已经替你改好了：和完周全聊聊")
+    service = ConversationService(
+        planner=planner,
+        ticktick_oauth_service=oauth_service,
+        task_command_service=task_command_service,
+    )
+    update = TelegramUpdate.model_validate(
+        {
+            "update_id": 4_0_1,
+            "message": {
+                "message_id": 10_0_1,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "和完周全聊聊改到下周",
+            },
+        }
+    )
+
+    replies = await service.handle_update(update)
+
+    assert [reply.text for reply in replies] == ["好，我已经替你改好了：和完周全聊聊"]
+    action = task_command_service.calls[0]["action"]
+    assert action.action_type == "update_task"
+    assert action.payload["match_title"] == "和完周全聊聊"
+    assert action.payload["semantic_type"] == "windowed"
+    assert action.payload["raw_nl_time"] == "下周"
+
+
+@pytest.mark.asyncio
+async def test_handle_update_rule_based_date_update_when_planner_returns_empty() -> None:
+    planner = FakePlanner(PlannedConversation())
+    oauth_service = FakeTickTickOAuthService(connected=True, auth_url=None)
+    task_command_service = FakeTaskCommandService("好，我已经替你改好了：回复PRL Referee")
+    service = ConversationService(
+        planner=planner,
+        ticktick_oauth_service=oauth_service,
+        task_command_service=task_command_service,
+    )
+    update = TelegramUpdate.model_validate(
+        {
+            "update_id": 4_0_2,
+            "message": {
+                "message_id": 10_0_2,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "回复PRL Referee 改到 4月3号",
+            },
+        }
+    )
+
+    replies = await service.handle_update(update)
+
+    assert [reply.text for reply in replies] == ["好，我已经替你改好了：回复PRL Referee"]
+    action = task_command_service.calls[0]["action"]
+    assert action.action_type == "update_task"
+    assert action.payload["match_title"] == "回复PRL Referee"
+    assert action.payload["semantic_type"] == "explicit_time"
+    assert action.payload["due_at"].startswith("2026-04-03T23:59")
+
+
+@pytest.mark.asyncio
+async def test_handle_update_rule_based_batch_handles_original_five_line_sample() -> None:
+    planner = FakePlanner(PlannedConversation())
+    oauth_service = FakeTickTickOAuthService(connected=True, auth_url=None)
+    task_command_service = SequencedTaskCommandService(
+        ["done-1", "done-2", "done-3", "done-4", "done-5"]
+    )
+    service = ConversationService(
+        planner=planner,
+        ticktick_oauth_service=oauth_service,
+        task_command_service=task_command_service,
+    )
+    update = TelegramUpdate.model_validate(
+        {
+            "update_id": 4_0_3,
+            "message": {
+                "message_id": 10_0_3,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": (
+                    "• 和家里打电话已完成\n"
+                    "• 回复PRL Referee 改到 4月3号\n"
+                    "• 和完周全聊聊改到下周\n"
+                    "• 处理ds2019的事情 改到今天晚上10点\n"
+                    "• \"时间阅读https://openai.com/zh-Hant-HK/index/harness-engineering/\"移动到下周"
+                ),
+            },
+        }
+    )
+
+    replies = await service.handle_update(update)
+
+    assert [reply.text for reply in replies] == ["done-1\ndone-2\ndone-3\ndone-4\ndone-5"]
+    actions = [call["action"] for call in task_command_service.calls]
+    assert [action.action_type for action in actions] == [
+        "complete_task",
+        "update_task",
+        "update_task",
+        "update_task",
+        "update_task",
+    ]
+    assert actions[0].payload["title"] == "和家里打电话"
+    assert actions[1].payload["match_title"] == "回复PRL Referee"
+    assert actions[1].payload["due_at"].startswith("2026-04-03T23:59")
+    assert actions[2].payload["match_title"] == "和完周全聊聊"
+    assert actions[2].payload["raw_nl_time"] == "下周"
+    assert actions[3].payload["match_title"] == "处理ds2019的事情"
+    assert actions[3].payload["due_at"].endswith("22:00:00-07:00")
+    assert actions[4].payload["match_title"] == "时间阅读https://openai.com/zh-Hant-HK/index/harness-engineering/"
+    assert actions[4].payload["raw_nl_time"] == "下周"
 
 
 @pytest.mark.asyncio
@@ -1971,8 +2117,8 @@ async def test_handle_update_executes_evening_review_reply_from_saved_reminder_c
     )
 
     class SequencedTaskCommandService(FakeTaskCommandService):
-        async def execute_action(self, *, telegram_user_id: str, action, now=None) -> str:
-            self.calls.append({"telegram_user_id": telegram_user_id, "action": action, "now": now})
+        async def execute_action(self, *, telegram_user_id: str, action, now=None, execution_cache=None) -> str:
+            self.calls.append({"telegram_user_id": telegram_user_id, "action": action, "now": now, "execution_cache": execution_cache})
             mapping = {
                 "complete_task": f"done:{action.target_task_id}",
                 "update_task": f"updated:{action.target_task_id}",
