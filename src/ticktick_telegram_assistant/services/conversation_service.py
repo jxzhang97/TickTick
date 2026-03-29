@@ -142,6 +142,11 @@ class ConversationService:
             telegram_user_id=self._telegram_user_id(update),
             text=update.message.text,
         )
+        assistant_transcript_reply = self._maybe_handle_pasted_assistant_transcript(update)
+        if assistant_transcript_reply is not None:
+            if trace is not None:
+                trace["status"] = "assistant_transcript"
+            return [assistant_transcript_reply]
         timezone_text_reply = await self._maybe_handle_timezone_text_update(update)
         if timezone_text_reply is not None:
             if trace is not None:
@@ -716,6 +721,47 @@ class ConversationService:
 
         combined_text = "\n".join(reply_texts)
         return [TelegramReply(chat_id=update.message.chat.id, text=combined_text)]
+
+    def _maybe_handle_pasted_assistant_transcript(
+        self,
+        update: TelegramUpdate,
+    ) -> TelegramReply | None:
+        if update.message is None or update.message.text is None:
+            return None
+        if not self._looks_like_pasted_assistant_transcript(update.message.text):
+            return None
+        return TelegramReply(
+            chat_id=update.message.chat.id,
+            text=(
+                "这段看起来是我之前回你的内容，不是新的任务指令。"
+                "我已经把它当成问题样本记下了，这次不会往 TickTick 里乱动。"
+                "你要继续处理原任务的话，直接把原任务本身发给我就行。"
+            ),
+        )
+
+    def _looks_like_pasted_assistant_transcript(self, text: str) -> bool:
+        lines = [line.strip() for line in self._context_builder.split_lines(text) if line.strip()]
+        if len(lines) < 2:
+            return False
+        transcript_like = sum(1 for line in lines if self._looks_like_assistant_reply_line(line))
+        return transcript_like >= max(2, len(lines) - 1)
+
+    def _looks_like_assistant_reply_line(self, text: str) -> bool:
+        markers = (
+            "我收到了你想",
+            "我看懂你是在",
+            "我还没连上你的 TickTick",
+            "TickTick 执行链路还没接上",
+            "现在 Telegram 收发已经打通",
+            "先不冒险帮你写入",
+            "所以这一步我先不乱动",
+            "我需要你再确认一下",
+            "基础服务已经起来了",
+            "我收到你的话了",
+            "真实执行链路还在补",
+            "我已经收到了你要看今天安排的意思",
+        )
+        return any(marker in text for marker in markers)
 
     def _build_ticktick_upstream_error_reply(
         self,

@@ -1380,6 +1380,48 @@ async def test_handle_update_multiline_batch_keeps_completed_replies_before_tick
 
 
 @pytest.mark.asyncio
+async def test_handle_update_treats_pasted_assistant_transcript_as_meta_not_task_batch() -> None:
+    planner = FakePlanner(
+        [
+            PlannedConversation(actions=[{"action_type": "complete_task", "payload": {"title": "和家里打电话"}}]),
+            PlannedConversation(actions=[{"action_type": "update_task", "payload": {"match_title": "回复PRL Referee"}}]),
+        ]
+    )
+    oauth_service = FakeTickTickOAuthService(connected=True, auth_url=None)
+    task_command_service = FakeTaskCommandService(reply_text="ok")
+    service = ConversationService(
+        planner=planner,
+        ticktick_oauth_service=oauth_service,
+        task_command_service=task_command_service,
+    )
+    update = TelegramUpdate.model_validate(
+        {
+            "update_id": 10_0_1,
+            "message": {
+                "message_id": 16_0_1,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": (
+                    "我收到了你想勾完成，不过 TickTick 执行链路还没接上，所以这一步我先不乱动。\n"
+                    "我看懂你是在改已有任务，但现在还没连上 TickTick，先不冒险帮你写入，免得改错。\n"
+                    "我看懂你是在改已有任务，但现在还没连上 TickTick，先不冒险帮你写入，免得改错。\n"
+                    "我看懂你是在改已有任务，但现在还没连上 TickTick，先不冒险帮你写入，免得改错。\n"
+                    "我看懂你是在改已有任务，但现在还没连上 TickTick，先不冒险帮你写入，免得改错。"
+                ),
+            },
+        }
+    )
+
+    replies = await service.handle_update(update)
+
+    assert len(replies) == 1
+    assert "看起来是我之前回你的内容" in replies[0].text
+    assert "不会往 TickTick 里乱动" in replies[0].text
+    assert planner.contexts == []
+    assert task_command_service.calls == []
+
+
+@pytest.mark.asyncio
 async def test_handle_update_normalizes_bulleted_multiline_batch_before_planning() -> None:
     planner = FakePlanner(
         [
