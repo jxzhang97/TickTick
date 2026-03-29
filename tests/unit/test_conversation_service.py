@@ -1549,6 +1549,86 @@ async def test_handle_update_requests_confirmation_for_time_conflict() -> None:
 
 
 @pytest.mark.asyncio
+async def test_handle_update_requests_confirmation_for_duplicate_rename() -> None:
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        session.add(
+            User(
+                telegram_user_id="99",
+                display_name="Jiaxin",
+                current_timezone="America/Los_Angeles",
+                ticktick_access_token="access-token",
+            )
+        )
+        session.commit()
+
+    planner = FakePlanner(
+        PlannedConversation(
+            actions=[
+                {
+                    "action_type": "update_task",
+                    "payload": {
+                        "match_title": "写周报草稿",
+                        "title": "写周报",
+                    },
+                }
+            ]
+        )
+    )
+    ticktick_client = FakeTickTickClient(
+        tasks=[
+            TickTickTask(
+                id="target-1",
+                projectId="telegram-inbox",
+                title="写周报草稿",
+                dueDate="2026-03-29T10:00:00.000-0700",
+                status=0,
+            ),
+            TickTickTask(
+                id="existing-dup",
+                projectId="telegram-inbox",
+                title="写周报",
+                dueDate="2026-03-30T10:00:00.000-0700",
+                status=0,
+            ),
+        ]
+    )
+    task_command_service = FakeTaskCommandService("should-not-run")
+    memory_service = MemoryService(session_factory=session_factory)
+    service = ConversationService(
+        planner=planner,
+        task_command_service=task_command_service,
+        session_factory=session_factory,
+        ticktick_client=ticktick_client,
+        memory_service=memory_service,
+    )
+
+    update = TelegramUpdate.model_validate(
+        {
+            "update_id": 19,
+            "message": {
+                "message_id": 25,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "把写周报草稿改成写周报",
+            },
+        }
+    )
+
+    replies = await service.handle_update(update)
+
+    assert len(replies) == 1
+    assert "很像" in replies[0].text
+    assert "写周报" in replies[0].text
+    assert task_command_service.calls == []
+    with session_factory() as session:
+        user = session.query(User).filter(User.telegram_user_id == "99").one()
+    context = memory_service.get_active_context(user_id=user.id, context_type="pending_confirmation")
+    assert context is not None
+    assert context.payload_json["candidate_task"]["task_id"] == "existing-dup"
+
+
+@pytest.mark.asyncio
 async def test_handle_update_requests_numbered_confirmation_for_ambiguous_update() -> None:
     session_factory = make_session_factory()
     with session_factory() as session:

@@ -551,7 +551,7 @@ class ConversationService:
         title = context.get("title")
         if not task_id or not title:
             return
-        action_title = self._action_title(action)
+        action_title = self._target_lookup_title(action)
         if action.action_type != "update_task" and action.action_type != "complete_task":
             return
         if action_title and self._normalize_title(action_title) != self._normalize_title(title):
@@ -574,6 +574,25 @@ class ConversationService:
             value = action.payload.get("title")
         else:
             value = None
+        if value is None:
+            return None
+        cleaned = str(value).strip()
+        return cleaned or None
+
+    def _target_lookup_title(self, action: PlannedAction) -> str | None:
+        if action.action_type == "update_task":
+            value = action.payload.get("match_title") or action.payload.get("title")
+        elif action.action_type == "complete_task":
+            value = action.payload.get("title")
+        else:
+            value = action.payload.get("title")
+        if value is None:
+            return None
+        cleaned = str(value).strip()
+        return cleaned or None
+
+    def _proposed_title(self, action: PlannedAction) -> str | None:
+        value = action.payload.get("title")
         if value is None:
             return None
         cleaned = str(value).strip()
@@ -1002,7 +1021,8 @@ class ConversationService:
             return None
 
         tasks = await self._ticktick_client.list_tasks(access_token=user.ticktick_access_token, since=None)
-        title = self._action_title(action)
+        title = self._proposed_title(action) if action.action_type == "update_task" else self._action_title(action)
+        target_lookup_title = self._target_lookup_title(action)
         start_at = self._coerce_datetime(action.payload.get("start_at"))
         due_at = self._coerce_datetime(action.payload.get("due_at"))
         end_at = self._coerce_datetime(action.payload.get("end_at"))
@@ -1017,7 +1037,7 @@ class ConversationService:
         if action.action_type in {"update_task", "complete_task"} and action.target_task_id is None:
             candidate_tasks = self._find_disambiguation_candidates(
                 tasks=tasks,
-                requested_title=title,
+                requested_title=target_lookup_title,
                 exclude_task_id=action.target_task_id,
             )
             if len(candidate_tasks) > 1:
@@ -1041,9 +1061,16 @@ class ConversationService:
                     },
                 )
                 return self._render_task_disambiguation_prompt(
-                    requested_title=title or "这条任务",
+                    requested_title=target_lookup_title or "这条任务",
                     candidates=rendered_candidates,
                 )
+            resolved_target = self._resolve_single_target_candidate(
+                tasks=tasks,
+                requested_title=target_lookup_title,
+                exclude_task_id=action.target_task_id,
+            )
+            if resolved_target is not None:
+                action.target_task_id = resolved_target.id
 
         duplicate_task = self._find_duplicate_task(tasks=tasks, title=title, exclude_task_id=action.target_task_id)
         if duplicate_task is not None and action.action_type == "create_task":
@@ -1058,6 +1085,19 @@ class ConversationService:
             return (
                 f"我看到一条和“{title}”很像的未完成任务：{duplicate_task.title}。"
                 "你想继续新建、合并到原来那条，还是改时间？"
+            )
+        if duplicate_task is not None and action.action_type == "update_task":
+            self._save_pending_confirmation(
+                telegram_user_id=telegram_user_id,
+                payload={
+                    "kind": "duplicate_update",
+                    "candidate_task": {"task_id": duplicate_task.id, "title": duplicate_task.title},
+                    "original_action": action.model_dump(),
+                },
+            )
+            return (
+                f"我看到一条和你要改成的“{title}”很像的未完成任务：{duplicate_task.title}。"
+                "你想继续改名、合并到原来那条，还是改成别的标题？"
             )
 
         if start_at is not None or due_at is not None:
@@ -1332,6 +1372,8 @@ class ConversationService:
         exact_matches = [task for task in open_tasks if self._normalize_title(task.title) == normalized_title]
         if len(exact_matches) > 1:
             return exact_matches
+        if len(exact_matches) == 1:
+            return []
         fuzzy_matches = [
             task
             for task in open_tasks
@@ -1349,6 +1391,34 @@ class ConversationService:
                 unique_matches.append(task)
             return unique_matches
         return []
+
+    def _resolve_single_target_candidate(
+        self,
+        *,
+        tasks: list,
+        requested_title: str | None,
+        exclude_task_id: str | None,
+    ):
+        candidates = self._find_disambiguation_candidates(
+            tasks=tasks,
+            requested_title=requested_title,
+            exclude_task_id=exclude_task_id,
+        )
+        if len(candidates) == 1:
+            return candidates[0]
+        if candidates:
+            return None
+        if not requested_title:
+            return None
+        normalized_title = self._normalize_title(requested_title)
+        for task in tasks:
+            if task.completed or task.status == 2:
+                continue
+            if exclude_task_id and task.id == exclude_task_id:
+                continue
+            if self._normalize_title(task.title) == normalized_title:
+                return task
+        return None
 
     def _find_conflicting_task(
         self,
