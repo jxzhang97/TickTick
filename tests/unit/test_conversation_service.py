@@ -62,6 +62,16 @@ class FakeTodayBriefService:
         return self._brief
 
 
+class FakeTaskQueryService:
+    def __init__(self, reply_text: str = "这是查询结果。") -> None:
+        self.reply_text = reply_text
+        self.calls: list[dict] = []
+
+    async def build_query_reply(self, *, telegram_user_id: str, query, now=None) -> str:
+        self.calls.append({"telegram_user_id": telegram_user_id, "query": query, "now": now})
+        return self.reply_text
+
+
 class FakeTimezoneResolver:
     def __init__(self, *, location_timezone: str | None = None, text_timezone: str | None = None) -> None:
         self.location_timezone = location_timezone
@@ -161,7 +171,16 @@ async def test_handle_update_falls_back_with_ticktick_setup_reply() -> None:
 
 @pytest.mark.asyncio
 async def test_handle_update_returns_oauth_link_for_ticktick_request_when_disconnected() -> None:
-    planner = FakePlanner(PlannedConversation())
+    planner = FakePlanner(
+        PlannedConversation(
+            intent_type="query",
+            query={
+                "query_kind": "today_brief",
+                "query_text": "今天有什么安排",
+                "time_scope": "today",
+            },
+        )
+    )
     oauth_service = FakeTickTickOAuthService(
         connected=False,
         auth_url="https://ticktick.com/oauth/authorize?state=abc",
@@ -184,7 +203,7 @@ async def test_handle_update_returns_oauth_link_for_ticktick_request_when_discon
     assert len(replies) == 1
     assert "授权" in replies[0].text
     assert "https://ticktick.com/oauth/authorize?state=abc" in replies[0].text
-    assert planner.contexts == []
+    assert planner.contexts[0].user_text == "今天有什么安排"
     assert oauth_service.calls == [
         {"method": "has_connection", "telegram_user_id": "99"},
         {
@@ -197,13 +216,22 @@ async def test_handle_update_returns_oauth_link_for_ticktick_request_when_discon
 
 @pytest.mark.asyncio
 async def test_handle_update_returns_today_brief_when_ticktick_connected() -> None:
-    planner = FakePlanner(PlannedConversation())
+    planner = FakePlanner(
+        PlannedConversation(
+            intent_type="query",
+            query={
+                "query_kind": "today_brief",
+                "query_text": "今天有什么安排",
+                "time_scope": "today",
+            },
+        )
+    )
     oauth_service = FakeTickTickOAuthService(connected=True, auth_url=None)
-    today_brief_service = FakeTodayBriefService("今天我先帮你抓重点：\n- 周五 11:00 发邮件")
+    query_service = FakeTaskQueryService("今天我先帮你抓重点：\n- 周五 11:00 发邮件")
     service = ConversationService(
         planner=planner,
         ticktick_oauth_service=oauth_service,
-        today_brief_service=today_brief_service,
+        task_query_service=query_service,
     )
     update = TelegramUpdate.model_validate(
         {
@@ -220,20 +248,30 @@ async def test_handle_update_returns_today_brief_when_ticktick_connected() -> No
     replies = await service.handle_update(update)
 
     assert [reply.text for reply in replies] == ["今天我先帮你抓重点：\n- 周五 11:00 发邮件"]
-    assert planner.contexts == []
+    assert planner.contexts[0].user_text == "今天有什么安排"
     assert oauth_service.calls == [{"method": "has_connection", "telegram_user_id": "99"}]
-    assert len(today_brief_service.calls) == 1
+    assert len(query_service.calls) == 1
+    assert query_service.calls[0]["query"].time_scope == "today"
 
 
 @pytest.mark.asyncio
 async def test_handle_update_recognizes_today_todo_question_as_today_brief() -> None:
-    planner = FakePlanner(PlannedConversation())
+    planner = FakePlanner(
+        PlannedConversation(
+            intent_type="query",
+            query={
+                "query_kind": "today_brief",
+                "query_text": "我今天要做什么",
+                "time_scope": "today",
+            },
+        )
+    )
     oauth_service = FakeTickTickOAuthService(connected=True, auth_url=None)
-    today_brief_service = FakeTodayBriefService("今天重点：\n- 先做 A")
+    query_service = FakeTaskQueryService("今天重点：\n- 先做 A")
     service = ConversationService(
         planner=planner,
         ticktick_oauth_service=oauth_service,
-        today_brief_service=today_brief_service,
+        task_query_service=query_service,
     )
     update = TelegramUpdate.model_validate(
         {
@@ -250,19 +288,29 @@ async def test_handle_update_recognizes_today_todo_question_as_today_brief() -> 
     replies = await service.handle_update(update)
 
     assert [reply.text for reply in replies] == ["今天重点：\n- 先做 A"]
-    assert planner.contexts == []
-    assert len(today_brief_service.calls) == 1
+    assert planner.contexts[0].user_text == "我今天要做什么"
+    assert len(query_service.calls) == 1
+    assert query_service.calls[0]["query"].query_text == "我今天要做什么"
 
 
 @pytest.mark.asyncio
 async def test_handle_update_recognizes_today_ganma_question_as_today_brief() -> None:
-    planner = FakePlanner(PlannedConversation())
+    planner = FakePlanner(
+        PlannedConversation(
+            intent_type="query",
+            query={
+                "query_kind": "today_brief",
+                "query_text": "今天要干嘛",
+                "time_scope": "today",
+            },
+        )
+    )
     oauth_service = FakeTickTickOAuthService(connected=True, auth_url=None)
-    today_brief_service = FakeTodayBriefService("今天重点：\n- 先做 A")
+    query_service = FakeTaskQueryService("今天重点：\n- 先做 A")
     service = ConversationService(
         planner=planner,
         ticktick_oauth_service=oauth_service,
-        today_brief_service=today_brief_service,
+        task_query_service=query_service,
     )
     update = TelegramUpdate.model_validate(
         {
@@ -279,8 +327,126 @@ async def test_handle_update_recognizes_today_ganma_question_as_today_brief() ->
     replies = await service.handle_update(update)
 
     assert [reply.text for reply in replies] == ["今天重点：\n- 先做 A"]
-    assert planner.contexts == []
-    assert len(today_brief_service.calls) == 1
+    assert planner.contexts[0].user_text == "今天要干嘛"
+    assert len(query_service.calls) == 1
+    assert query_service.calls[0]["query"].query_text == "今天要干嘛"
+
+
+@pytest.mark.asyncio
+async def test_handle_update_executes_recent_query_from_planner_when_connected() -> None:
+    planner = FakePlanner(
+        PlannedConversation(
+            intent_type="query",
+            query={
+                "query_kind": "schedule_query",
+                "query_text": "我最近有什么事",
+                "time_scope": "recent",
+            },
+        )
+    )
+    oauth_service = FakeTickTickOAuthService(connected=True, auth_url=None)
+    query_service = FakeTaskQueryService("最近这几天你最该盯的事我先拎出来了。")
+    service = ConversationService(
+        planner=planner,
+        ticktick_oauth_service=oauth_service,
+        task_query_service=query_service,
+    )
+    update = TelegramUpdate.model_validate(
+        {
+            "update_id": 4_3,
+            "message": {
+                "message_id": 10_3,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "我最近有什么事",
+            },
+        }
+    )
+
+    replies = await service.handle_update(update)
+
+    assert [reply.text for reply in replies] == ["最近这几天你最该盯的事我先拎出来了。"]
+    assert planner.contexts[0].user_text == "我最近有什么事"
+    assert oauth_service.calls == [{"method": "has_connection", "telegram_user_id": "99"}]
+    assert len(query_service.calls) == 1
+    assert query_service.calls[0]["query"].time_scope == "recent"
+
+
+@pytest.mark.asyncio
+async def test_handle_update_executes_overdue_query_from_planner_when_connected() -> None:
+    planner = FakePlanner(
+        PlannedConversation(
+            intent_type="query",
+            query={
+                "query_kind": "overdue_review",
+                "query_text": "我手上还挂着什么",
+                "time_scope": "overdue",
+            },
+        )
+    )
+    oauth_service = FakeTickTickOAuthService(connected=True, auth_url=None)
+    query_service = FakeTaskQueryService("我先把还挂着的截止项列出来。")
+    service = ConversationService(
+        planner=planner,
+        ticktick_oauth_service=oauth_service,
+        task_query_service=query_service,
+    )
+    update = TelegramUpdate.model_validate(
+        {
+            "update_id": 4_4,
+            "message": {
+                "message_id": 10_4,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "我手上还挂着什么",
+            },
+        }
+    )
+
+    replies = await service.handle_update(update)
+
+    assert [reply.text for reply in replies] == ["我先把还挂着的截止项列出来。"]
+    assert query_service.calls[0]["query"].time_scope == "overdue"
+
+
+@pytest.mark.asyncio
+async def test_handle_update_executes_custom_range_query_from_planner_when_connected() -> None:
+    planner = FakePlanner(
+        PlannedConversation(
+            intent_type="query",
+            query={
+                "query_kind": "schedule_query",
+                "query_text": "4 月 1 日到 4 月 3 日我有什么事",
+                "time_scope": "custom_range",
+                "range_start": "2026-04-01T00:00:00-07:00",
+                "range_end": "2026-04-03T23:59:00-07:00",
+            },
+        )
+    )
+    oauth_service = FakeTickTickOAuthService(connected=True, auth_url=None)
+    query_service = FakeTaskQueryService("这段时间的安排我先帮你捋出来了。")
+    service = ConversationService(
+        planner=planner,
+        ticktick_oauth_service=oauth_service,
+        task_query_service=query_service,
+    )
+    update = TelegramUpdate.model_validate(
+        {
+            "update_id": 4_5,
+            "message": {
+                "message_id": 10_5,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "4 月 1 日到 4 月 3 日我有什么事",
+            },
+        }
+    )
+
+    replies = await service.handle_update(update)
+
+    assert [reply.text for reply in replies] == ["这段时间的安排我先帮你捋出来了。"]
+    assert query_service.calls[0]["query"].time_scope == "custom_range"
+    assert query_service.calls[0]["query"].range_start.isoformat() == "2026-04-01T00:00:00-07:00"
 
 
 @pytest.mark.asyncio
@@ -567,6 +733,78 @@ async def test_handle_update_saves_today_brief_query_prompt_for_follow_up_yes() 
 
     assert [reply.text for reply in first_replies] == ["要我帮你列出 TickTick 中今天的任务吗？"]
     assert [reply.text for reply in second_replies] == ["今天重点：\n- 先做 A"]
+    assert memory_service.get_active_context(user_id=user_id, context_type="pending_query") is None
+
+
+@pytest.mark.asyncio
+async def test_handle_update_yes_reply_uses_saved_structured_query_prompt() -> None:
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        user = User(
+            telegram_user_id="99",
+            display_name="Jiaxin",
+            current_timezone="America/Los_Angeles",
+            ticktick_access_token="access-token",
+        )
+        session.add(user)
+        session.flush()
+        user_id = user.id
+        session.commit()
+
+    planner = FakePlanner(
+        [
+            PlannedConversation(
+                intent_type="query",
+                query={
+                    "query_kind": "schedule_query",
+                    "query_text": "我最近有什么事",
+                    "time_scope": "recent",
+                },
+                assistant_reply="要不要我把最近这段时间要留意的事也一起列给你？",
+            ),
+            PlannedConversation(),
+        ]
+    )
+    memory_service = MemoryService(session_factory=session_factory)
+    query_service = FakeTaskQueryService("最近这段时间你最该盯的事我先拎出来了。")
+    oauth_service = FakeTickTickOAuthService(connected=True, auth_url=None)
+    service = ConversationService(
+        planner=planner,
+        ticktick_oauth_service=oauth_service,
+        task_query_service=query_service,
+        session_factory=session_factory,
+        memory_service=memory_service,
+    )
+    first_update = TelegramUpdate.model_validate(
+        {
+            "update_id": 6_4,
+            "message": {
+                "message_id": 12_4,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "帮我看看",
+            },
+        }
+    )
+    second_update = TelegramUpdate.model_validate(
+        {
+            "update_id": 6_5,
+            "message": {
+                "message_id": 12_5,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "对",
+            },
+        }
+    )
+
+    first_replies = await service.handle_update(first_update)
+    second_replies = await service.handle_update(second_update)
+
+    assert [reply.text for reply in first_replies] == ["要不要我把最近这段时间要留意的事也一起列给你？"]
+    assert [reply.text for reply in second_replies] == ["最近这段时间你最该盯的事我先拎出来了。"]
+    assert len(query_service.calls) == 1
+    assert query_service.calls[0]["query"].time_scope == "recent"
     assert memory_service.get_active_context(user_id=user_id, context_type="pending_query") is None
 
 

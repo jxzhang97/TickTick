@@ -141,6 +141,189 @@ def test_plan_parses_query_today_brief_intent() -> None:
     assert planned.assistant_reply == "今天我先帮你看安排。"
 
 
+def test_plan_parses_recent_query_intent_with_custom_range_fields() -> None:
+    client = FakeOpenAIClient(
+        """
+        {
+          "intent_type": "query",
+          "query": {
+            "query_kind": "schedule_query",
+            "query_text": "我最近有什么事",
+            "time_scope": "recent",
+            "range_start": "2026-03-27T00:00:00-07:00",
+            "range_end": "2026-04-03T23:59:00-07:00"
+          },
+          "actions": [],
+          "requires_confirmation": false,
+          "assistant_reply": null
+        }
+        """
+    )
+    planner = OpenAIPlanner(client=client)
+
+    planned = asyncio.run(
+        planner.plan(
+            ConversationContext(
+                user_text="我最近有什么事",
+                current_timezone="America/Los_Angeles",
+                current_local_time="2026-03-27T09:00:00-07:00",
+                recent_conversation_summaries=["最近在安排 talk 和 ddl"],
+            )
+        )
+    )
+
+    assert planned.intent_type == "query"
+    assert planned.query is not None
+    assert planned.query.query_kind == "schedule_query"
+    assert planned.query.query_text == "我最近有什么事"
+    assert planned.query.time_scope == "recent"
+    assert planned.query.range_start.isoformat() == "2026-03-27T00:00:00-07:00"
+    assert planned.query.range_end.isoformat() == "2026-04-03T23:59:00-07:00"
+    prompt = client.responses.calls[0]["input"]
+    assert "recent|upcoming|overdue|this_week|custom_range" in prompt
+    assert "range_start" in prompt
+    assert "range_end" in prompt
+    assert "今天要干嘛" in prompt
+    assert "我最近有什么事" in prompt
+    assert "最近在安排 talk 和 ddl" in prompt
+
+
+def test_plan_parses_upcoming_query_intent() -> None:
+    planner = OpenAIPlanner(
+        client=FakeOpenAIClient(
+            """
+            {
+              "intent_type": "query",
+              "query": {
+                "query_kind": "schedule_query",
+                "query_text": "未来几天有什么安排",
+                "time_scope": "upcoming"
+              },
+              "actions": [],
+              "requires_confirmation": false,
+              "assistant_reply": null
+            }
+            """
+        )
+    )
+
+    planned = asyncio.run(
+        planner.plan(
+            ConversationContext(
+                user_text="未来几天有什么安排",
+                current_timezone="America/Los_Angeles",
+                current_local_time="2026-03-27T09:00:00-07:00",
+            )
+        )
+    )
+
+    assert planned.query is not None
+    assert planned.query.time_scope == "upcoming"
+
+
+def test_plan_parses_overdue_query_intent() -> None:
+    planner = OpenAIPlanner(
+        client=FakeOpenAIClient(
+            """
+            {
+              "intent_type": "query",
+              "query": {
+                "query_kind": "overdue_review",
+                "query_text": "我手上还挂着什么",
+                "time_scope": "overdue"
+              },
+              "actions": [],
+              "requires_confirmation": false,
+              "assistant_reply": null
+            }
+            """
+        )
+    )
+
+    planned = asyncio.run(
+        planner.plan(
+            ConversationContext(
+                user_text="我手上还挂着什么",
+                current_timezone="America/Los_Angeles",
+                current_local_time="2026-03-27T09:00:00-07:00",
+            )
+        )
+    )
+
+    assert planned.query is not None
+    assert planned.query.time_scope == "overdue"
+
+
+def test_plan_parses_this_week_query_intent() -> None:
+    planner = OpenAIPlanner(
+        client=FakeOpenAIClient(
+            """
+            {
+              "intent_type": "query",
+              "query": {
+                "query_kind": "schedule_query",
+                "query_text": "这周有什么安排",
+                "time_scope": "this_week"
+              },
+              "actions": [],
+              "requires_confirmation": false,
+              "assistant_reply": null
+            }
+            """
+        )
+    )
+
+    planned = asyncio.run(
+        planner.plan(
+            ConversationContext(
+                user_text="这周有什么安排",
+                current_timezone="America/Los_Angeles",
+                current_local_time="2026-03-27T09:00:00-07:00",
+            )
+        )
+    )
+
+    assert planned.query is not None
+    assert planned.query.time_scope == "this_week"
+
+
+def test_plan_parses_custom_range_query_intent() -> None:
+    planner = OpenAIPlanner(
+        client=FakeOpenAIClient(
+            """
+            {
+              "intent_type": "query",
+              "query": {
+                "query_kind": "schedule_query",
+                "query_text": "4 月 1 日到 4 月 3 日我有什么事",
+                "time_scope": "custom_range",
+                "range_start": "2026-04-01T00:00:00-07:00",
+                "range_end": "2026-04-03T23:59:00-07:00"
+              },
+              "actions": [],
+              "requires_confirmation": false,
+              "assistant_reply": null
+            }
+            """
+        )
+    )
+
+    planned = asyncio.run(
+        planner.plan(
+            ConversationContext(
+                user_text="4 月 1 日到 4 月 3 日我有什么事",
+                current_timezone="America/Los_Angeles",
+                current_local_time="2026-03-27T09:00:00-07:00",
+            )
+        )
+    )
+
+    assert planned.query is not None
+    assert planned.query.time_scope == "custom_range"
+    assert planned.query.range_start.isoformat() == "2026-04-01T00:00:00-07:00"
+    assert planned.query.range_end.isoformat() == "2026-04-03T23:59:00-07:00"
+
+
 def test_plan_parses_clarification_intent() -> None:
     planner = OpenAIPlanner(
         client=FakeOpenAIClient(

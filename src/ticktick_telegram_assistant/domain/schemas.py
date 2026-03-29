@@ -44,6 +44,8 @@ class PlannedQueryIntent(BaseModel):
     query_kind: str
     query_text: Optional[str] = None
     time_scope: Optional[str] = None
+    range_start: Optional[datetime] = None
+    range_end: Optional[datetime] = None
     target_task_id: Optional[str] = None
     target_title: Optional[str] = None
 

@@ -16,6 +16,7 @@ from ticktick_telegram_assistant.integrations.ticktick_oauth_client import TickT
 from ticktick_telegram_assistant.services.conversation_service import ConversationService
 from ticktick_telegram_assistant.services.memory_service import MemoryService
 from ticktick_telegram_assistant.services.task_command_service import TaskCommandService
+from ticktick_telegram_assistant.services.task_query_service import TaskQueryService
 from ticktick_telegram_assistant.services.ticktick_oauth_service import TickTickOAuthService
 from ticktick_telegram_assistant.services.timezone_resolver import TimezoneResolver
 from ticktick_telegram_assistant.services.today_brief_service import TodayBriefService
@@ -122,13 +123,20 @@ def build_local_runner(settings: Settings | None = None) -> LocalAssistantRunner
     )
     memory_service = MemoryService(session_factory=session_factory)
     planner = OpenAIPlanner(client=AsyncOpenAI(api_key=app_settings.openai_api_key) if app_settings.openai_api_key else None)
+    today_brief_service = TodayBriefService(
+        session_factory=session_factory,
+        ticktick_client=ticktick_client,
+    )
+    task_query_service = TaskQueryService(
+        session_factory=session_factory,
+        ticktick_client=ticktick_client,
+        today_brief_service=today_brief_service,
+    )
     conversation_service = ConversationService(
         planner=planner,
         ticktick_oauth_service=ticktick_oauth_service,
-        today_brief_service=TodayBriefService(
-            session_factory=session_factory,
-            ticktick_client=ticktick_client,
-        ),
+        today_brief_service=today_brief_service,
+        task_query_service=task_query_service,
         task_command_service=TaskCommandService(
             session_factory=session_factory,
             ticktick_client=ticktick_client,

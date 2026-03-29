@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from datetime import timedelta
 from zoneinfo import ZoneInfo
@@ -12,6 +13,19 @@ from ticktick_telegram_assistant.integrations.ticktick_client import TickTickCli
 from ticktick_telegram_assistant.repositories.task_shadows import TaskShadowRepository
 from ticktick_telegram_assistant.services.briefing_service import BriefingService
 from ticktick_telegram_assistant.services.message_renderer import MessageRenderer
+
+
+@dataclass
+class TaskBriefSnapshot:
+    current_time: datetime
+    timezone_name: str
+    today_timed_items: list[dict]
+    today_date_only_items: list[dict]
+    active_windowed_items: list[dict]
+    overdue_items: list[dict]
+    upcoming_explicit_items: list[dict]
+    upcoming_windowed_items: list[dict]
+    memo_items: list[dict]
 
 
 class TodayBriefService:
@@ -34,6 +48,16 @@ class TodayBriefService:
         user = self._get_user(telegram_user_id=telegram_user_id)
         return await self.build_today_brief_for_user(user=user, now=now)
 
+    async def build_snapshot(
+        self,
+        *,
+        telegram_user_id: str,
+        now: datetime | None = None,
+        tasks: list[TickTickTask] | None = None,
+    ) -> TaskBriefSnapshot | None:
+        user = self._get_user(telegram_user_id=telegram_user_id)
+        return await self.build_snapshot_for_user(user=user, now=now, tasks=tasks)
+
     async def build_today_brief_for_user(
         self,
         *,
@@ -41,8 +65,30 @@ class TodayBriefService:
         now: datetime | None = None,
         tasks: list[TickTickTask] | None = None,
     ) -> str:
-        if user is None or not user.ticktick_access_token:
+        snapshot = await self.build_snapshot_for_user(user=user, now=now, tasks=tasks)
+        if snapshot is None:
             return "我现在还没拿到你的 TickTick 访问权限，所以还不能替你拉今天的安排。"
+
+        return self._briefing_service.render_morning_brief(
+            current_time=snapshot.current_time,
+            today_timed_items=snapshot.today_timed_items,
+            today_date_only_items=snapshot.today_date_only_items,
+            active_windowed_items=snapshot.active_windowed_items,
+            overdue_items=snapshot.overdue_items,
+            upcoming_explicit_items=snapshot.upcoming_explicit_items,
+            upcoming_windowed_items=snapshot.upcoming_windowed_items,
+            memo_items=snapshot.memo_items,
+        )
+
+    async def build_snapshot_for_user(
+        self,
+        *,
+        user: User | None,
+        now: datetime | None = None,
+        tasks: list[TickTickTask] | None = None,
+    ) -> TaskBriefSnapshot | None:
+        if user is None or not user.ticktick_access_token:
+            return None
 
         timezone_name = user.current_timezone or "America/Los_Angeles"
         current_time = now or datetime.now(ZoneInfo(timezone_name))
@@ -73,45 +119,57 @@ class TodayBriefService:
         ]
         tasks_by_id = {task.id: task for task in fetched_tasks if task.status != 2 and not task.completed}
 
-        today_timed_items = sorted(
-            [
-                item
-                for item in task_records
-                if item["semantic_type"] != "windowed"
-                and item["date_obj"] == today
-                and not item["is_all_day"]
-            ],
-            key=lambda item: item["sort_key"],
+        today_timed_items = self._annotate_section(
+            sorted(
+                [
+                    item
+                    for item in task_records
+                    if item["semantic_type"] != "windowed"
+                    and item["date_obj"] == today
+                    and not item["is_all_day"]
+                ],
+                key=lambda item: item["sort_key"],
+            ),
+            "today_timed",
         )
-        today_date_only_items = sorted(
-            [
-                item
-                for item in task_records
-                if item["semantic_type"] != "windowed"
-                and item["date_obj"] == today
-                and item["is_all_day"]
-            ],
-            key=lambda item: item["sort_key"],
+        today_date_only_items = self._annotate_section(
+            sorted(
+                [
+                    item
+                    for item in task_records
+                    if item["semantic_type"] != "windowed"
+                    and item["date_obj"] == today
+                    and item["is_all_day"]
+                ],
+                key=lambda item: item["sort_key"],
+            ),
+            "today_date_only",
         )
-        overdue_items = sorted(
-            [
-                item
-                for item in task_records
-                if item["semantic_type"] != "windowed"
-                and item["date_obj"] is not None
-                and item["date_obj"] < today
-            ],
-            key=lambda item: item["sort_key"],
+        overdue_items = self._annotate_section(
+            sorted(
+                [
+                    item
+                    for item in task_records
+                    if item["semantic_type"] != "windowed"
+                    and item["date_obj"] is not None
+                    and item["date_obj"] < today
+                ],
+                key=lambda item: item["sort_key"],
+            ),
+            "overdue",
         )
-        upcoming_explicit_items = sorted(
-            [
-                item
-                for item in task_records
-                if item["semantic_type"] != "windowed"
-                and item["date_obj"] is not None
-                and today < item["date_obj"] <= today + timedelta(days=7)
-            ],
-            key=lambda item: item["sort_key"],
+        upcoming_explicit_items = self._annotate_section(
+            sorted(
+                [
+                    item
+                    for item in task_records
+                    if item["semantic_type"] != "windowed"
+                    and item["date_obj"] is not None
+                    and today < item["date_obj"] <= today + timedelta(days=7)
+                ],
+                key=lambda item: item["sort_key"],
+            ),
+            "upcoming_explicit",
         )
         active_windowed_items, upcoming_windowed_items = self._build_windowed_items(
             windowed_shadows=windowed_shadows,
@@ -124,8 +182,9 @@ class TodayBriefService:
             tasks_by_id=tasks_by_id,
         )
 
-        return self._briefing_service.render_morning_brief(
+        return TaskBriefSnapshot(
             current_time=current_time,
+            timezone_name=timezone_name,
             today_timed_items=today_timed_items,
             today_date_only_items=today_date_only_items,
             active_windowed_items=active_windowed_items,
@@ -134,6 +193,9 @@ class TodayBriefService:
             upcoming_windowed_items=upcoming_windowed_items,
             memo_items=memo_items,
         )
+
+    def _annotate_section(self, items: list[dict], section: str) -> list[dict]:
+        return [dict(item, section=section) for item in items]
 
     def _get_user(self, *, telegram_user_id: str) -> User | None:
         with self._session_factory() as session:
@@ -225,7 +287,10 @@ class TodayBriefService:
                 upcoming_items.append(item)
         active_items.sort(key=lambda item: item["sort_key"])
         upcoming_items.sort(key=lambda item: item["sort_key"])
-        return active_items[:8], upcoming_items[:8]
+        return self._annotate_section(active_items, "windowed_active"), self._annotate_section(
+            upcoming_items,
+            "windowed_upcoming",
+        )
 
     def _build_memo_items(
         self,
@@ -255,7 +320,7 @@ class TodayBriefService:
                 }
             )
         items.sort(key=lambda item: (-(item.get("priority") or 0), item.get("title") or ""))
-        return items[:8]
+        return self._annotate_section(items, "memo")
 
     def _infer_semantic_type(
         self,

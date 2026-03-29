@@ -46,9 +46,11 @@ class OpenAIPlanner:
             {{
               "intent_type": "query|reminder_control|clarification|task_write",
               "query": {{
-                "query_kind": "today_brief|task_lookup|schedule_query|other",
+                "query_kind": "today_brief|task_lookup|schedule_query|overdue_review|other",
                 "query_text": "用户原始查询",
-                "time_scope": "today|tomorrow|this_week|custom"
+                "time_scope": "today|tomorrow|recent|upcoming|overdue|this_week|custom_range",
+                "range_start": "可选 ISO 8601，仅 custom_range 等需要明确起点时填写",
+                "range_end": "可选 ISO 8601，仅 custom_range 等需要明确终点时填写"
               }},
               "reminder_control": {{
                 "control_type": "snooze|stop|resume|reschedule",
@@ -102,6 +104,9 @@ class OpenAIPlanner:
             2. 用户明确说某条任务“做完了/完成了/勾掉”，并且文本里带了可定位的标题时，用 task_write=complete，并保持 complete_task action。
             3. 用户明确说要改已有任务的时间、说明、标题或 list，并且文本里带了可定位的标题时，用 task_write=update，并保持 update_task action；原任务标题放进 match_title，新的标题才放进 title。
             4. 用户说的是今天安排、日程查询、today brief 之类查询时，用 intent_type=query，填 query，actions 置空。
+            4a. 查询统一尽量落到这些范围之一：today、tomorrow、recent、upcoming、overdue、this_week、custom_range。
+            4b. 口语也按查询理解，例如“今天要干嘛”“我最近有什么事”“这周我要忙什么”“最近快到期的有哪些”。
+            4c. “recent” 适合“最近/这几天/手上还挂着什么”这类混合视角查询；“upcoming” 适合“未来几天/接下来几天”；“overdue” 适合“逾期/没做完/还挂着的截止项”；“this_week” 适合“这周/本周”。
             5. 用户说的是只调整 Telegram 侧提醒、稍后再提醒、暂停提醒、恢复提醒时，用 intent_type=reminder_control，填 reminder_control，actions 置空。
             6. 用户需要先确认怎么做时，用 intent_type=clarification，填 clarification，requires_confirmation 设为 true，actions 置空。
             7. 用户在改已有任务、完成已有任务但指代不清、或其他高风险写操作时，actions 置空，requires_confirmation 设为 true，并给一句简短中文确认。
@@ -119,6 +124,7 @@ class OpenAIPlanner:
             当前本地时间: {context.current_local_time}
             当前时区: {context.current_timezone}
             相关记忆: {json.dumps(context.memory_items, ensure_ascii=False)}
+            最近对话摘要: {json.dumps(context.recent_conversation_summaries, ensure_ascii=False)}
             候选任务: {json.dumps(context.candidate_tasks, ensure_ascii=False)}
             用户原话: {context.user_text}
             """

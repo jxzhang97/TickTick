@@ -15,6 +15,7 @@ from ticktick_telegram_assistant.domain.schemas import (
     ConversationContext,
     PlannedAction,
     PlannedConversation,
+    PlannedQueryIntent,
     TelegramReply,
 )
 from ticktick_telegram_assistant.integrations.openai_planner import OpenAIPlanner
@@ -63,6 +64,7 @@ class ConversationService:
         evening_review_service: EveningReviewService | None = None,
         ticktick_oauth_service=None,
         today_brief_service=None,
+        task_query_service=None,
         task_command_service=None,
         session_factory: sessionmaker[Session] | None = None,
         reminder_service: ReminderService | None = None,
@@ -77,6 +79,7 @@ class ConversationService:
         self._evening_review_service = evening_review_service or EveningReviewService()
         self._ticktick_oauth_service = ticktick_oauth_service
         self._today_brief_service = today_brief_service
+        self._task_query_service = task_query_service
         self._task_command_service = task_command_service
         self._session_factory = session_factory
         self._reminder_service = reminder_service or ReminderService()
@@ -169,11 +172,6 @@ class ConversationService:
             if trace is not None:
                 trace["status"] = "memo_cleanup"
             return [memo_cleanup_reply]
-        ticktick_reply = await self._maybe_build_ticktick_reply(update)
-        if ticktick_reply is not None:
-            if trace is not None:
-                trace["status"] = "ticktick_reply"
-            return [ticktick_reply]
         telegram_user_id = self._telegram_user_id(update)
         resolved_text = self._resolve_follow_up_text(
             telegram_user_id=telegram_user_id,
@@ -188,6 +186,14 @@ class ConversationService:
         planned = await self._planner.plan(context)
         if trace is not None:
             trace["parsed_plan_json"] = planned.model_dump(mode="json")
+        query_reply = await self._maybe_execute_planned_query(
+            update=update,
+            planned=planned,
+            telegram_user_id=telegram_user_id,
+            trace=trace,
+        )
+        if query_reply is not None:
+            return [query_reply]
         action_reply = await self._maybe_execute_planned_actions(
             update=update,
             planned=planned,
@@ -197,10 +203,16 @@ class ConversationService:
         )
         if action_reply is not None:
             return [action_reply]
+        ticktick_reply = await self._maybe_build_ticktick_reply(update)
+        if ticktick_reply is not None:
+            if trace is not None:
+                trace["status"] = "ticktick_fallback"
+            return [ticktick_reply]
         reply_text = planned.assistant_reply or self._fallback_reply(update.message.text)
         self._maybe_save_pending_query(
             telegram_user_id=telegram_user_id,
             reply_text=reply_text,
+            planned=planned,
         )
         if trace is not None:
             trace["status"] = "assistant_reply"
@@ -336,11 +348,9 @@ class ConversationService:
         connected = await self._ticktick_oauth_service.has_connection(telegram_user_id=telegram_user_id)
         if connected:
             if self._today_brief_service is not None and self._looks_like_today_brief_request(update.message.text):
-                return TelegramReply(
+                return await self._build_connected_today_brief_reply(
                     chat_id=update.message.chat.id,
-                    text=await self._today_brief_service.build_today_brief(
-                        telegram_user_id=telegram_user_id,
-                    ),
+                    telegram_user_id=telegram_user_id,
                 )
             return None
 
@@ -456,6 +466,14 @@ class ConversationService:
             return None
         if not planned.actions:
             return None
+        auth_reply = await self._maybe_require_ticktick_connection(
+            chat_id=update.message.chat.id,
+            telegram_user_id=telegram_user_id,
+        )
+        if auth_reply is not None:
+            if trace is not None:
+                trace["status"] = "ticktick_auth_required"
+            return auth_reply
         if (
             not allow_non_ticktick_request
             and not self._looks_like_ticktick_request(update.message.text)
@@ -484,6 +502,68 @@ class ConversationService:
             source_text=update.message.text,
         )
         return TelegramReply(chat_id=update.message.chat.id, text=reply_text)
+
+    async def _maybe_execute_planned_query(
+        self,
+        *,
+        update: TelegramUpdate,
+        planned: PlannedConversation,
+        telegram_user_id: str | None,
+        trace: dict[str, object] | None = None,
+    ) -> TelegramReply | None:
+        if (
+            planned.intent_type != "query"
+            or planned.query is None
+            or update.message is None
+            or telegram_user_id is None
+        ):
+            return None
+        auth_reply = await self._maybe_require_ticktick_connection(
+            chat_id=update.message.chat.id,
+            telegram_user_id=telegram_user_id,
+        )
+        if auth_reply is not None:
+            if trace is not None:
+                trace["status"] = "ticktick_auth_required"
+            return auth_reply
+        if planned.assistant_reply and self._looks_like_query_follow_up_prompt(planned.assistant_reply):
+            return None
+        if self._task_query_service is None:
+            if planned.query.time_scope == "today":
+                reply = await self._build_connected_today_brief_reply(
+                    chat_id=update.message.chat.id,
+                    telegram_user_id=telegram_user_id,
+                )
+                if trace is not None:
+                    trace["status"] = "query_reply"
+                return reply
+            return TelegramReply(
+                chat_id=update.message.chat.id,
+                text="我知道你是在查 TickTick 里的安排，但这条查询链路现在还没完全接好。",
+            )
+        reply_text = await self._task_query_service.build_query_reply(
+            telegram_user_id=telegram_user_id,
+            query=planned.query,
+        )
+        if trace is not None:
+            trace["status"] = "query_reply"
+        return TelegramReply(chat_id=update.message.chat.id, text=reply_text)
+
+    async def _maybe_require_ticktick_connection(
+        self,
+        *,
+        chat_id: int,
+        telegram_user_id: str,
+    ) -> TelegramReply | None:
+        if self._ticktick_oauth_service is None:
+            return None
+        connected = await self._ticktick_oauth_service.has_connection(telegram_user_id=telegram_user_id)
+        if connected:
+            return None
+        return await self._build_ticktick_auth_reply(
+            chat_id=chat_id,
+            telegram_user_id=telegram_user_id,
+        )
 
     def _save_planner_confirmation(
         self,
@@ -1151,6 +1231,27 @@ class ConversationService:
                 chat_id=update.message.chat.id,
                 telegram_user_id=telegram_user_id,
             )
+        if context.get("kind") == "structured_query" and any(
+            token in lowered for token in ("对", "是", "好", "好的", "行", "可以", "嗯")
+        ):
+            query_payload = context.get("query") or {}
+            query = PlannedQueryIntent.model_validate(query_payload)
+            self._clear_pending_query(telegram_user_id=telegram_user_id)
+            auth_reply = await self._maybe_require_ticktick_connection(
+                chat_id=update.message.chat.id,
+                telegram_user_id=telegram_user_id,
+            )
+            if auth_reply is not None:
+                return auth_reply
+            if self._task_query_service is None:
+                return None
+            return TelegramReply(
+                chat_id=update.message.chat.id,
+                text=await self._task_query_service.build_query_reply(
+                    telegram_user_id=telegram_user_id,
+                    query=query,
+                ),
+            )
 
         return None
 
@@ -1517,8 +1618,28 @@ class ConversationService:
         stripped = re.sub(r"^\s*第\s*[0-9一二三四五六七八九十]+\s*(?:条|个)?\s*", "", text)
         return stripped.strip()
 
-    def _maybe_save_pending_query(self, *, telegram_user_id: str | None, reply_text: str) -> None:
+    def _maybe_save_pending_query(
+        self,
+        *,
+        telegram_user_id: str | None,
+        reply_text: str,
+        planned: PlannedConversation | None = None,
+    ) -> None:
         if telegram_user_id is None:
+            return
+        if (
+            planned is not None
+            and planned.intent_type == "query"
+            and planned.query is not None
+            and self._looks_like_query_follow_up_prompt(reply_text)
+        ):
+            self._save_pending_query(
+                telegram_user_id=telegram_user_id,
+                payload={
+                    "kind": "structured_query",
+                    "query": planned.query.model_dump(mode="json"),
+                },
+            )
             return
         if self._looks_like_today_brief_prompt(reply_text):
             self._save_pending_query(
@@ -1532,6 +1653,12 @@ class ConversationService:
             token in text or token in lowered
             for token in ("任务吗", "安排吗", "日程吗", "列出", "看看", "要我帮你", "帮你列")
         )
+
+    def _looks_like_query_follow_up_prompt(self, text: str) -> bool:
+        lowered = text.casefold()
+        if not any(token in text or token in lowered for token in ("要我", "要不要", "帮你", "列出", "看看", "捋一遍")):
+            return False
+        return "吗" in text or "？" in text or "?" in text
 
     def _save_pending_query(self, *, telegram_user_id: str, payload: dict) -> None:
         if self._memory_service is None:
@@ -1577,6 +1704,18 @@ class ConversationService:
                     chat_id=chat_id,
                     telegram_user_id=telegram_user_id,
                 )
+        if self._task_query_service is not None:
+            return TelegramReply(
+                chat_id=chat_id,
+                text=await self._task_query_service.build_query_reply(
+                    telegram_user_id=telegram_user_id,
+                    query=PlannedQueryIntent(
+                        query_kind="today_brief",
+                        query_text="今天有什么安排",
+                        time_scope="today",
+                    ),
+                ),
+            )
         if self._today_brief_service is None:
             return TelegramReply(
                 chat_id=chat_id,
