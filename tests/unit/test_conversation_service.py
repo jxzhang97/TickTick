@@ -5,6 +5,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from ticktick_telegram_assistant.db.base import Base
+from ticktick_telegram_assistant.db.models.action_log import ActionLog
 from ticktick_telegram_assistant.db.models.reminder_event import ReminderEvent
 from ticktick_telegram_assistant.db.models.memory_fact import MemoryFact
 from ticktick_telegram_assistant.db.models.user import User
@@ -296,6 +297,101 @@ async def test_handle_update_executes_create_action_when_ticktick_connected() ->
     assert len(task_command_service.calls) == 1
     assert task_command_service.calls[0]["telegram_user_id"] == "99"
     assert task_command_service.calls[0]["action"].action_type == "create_task"
+
+
+@pytest.mark.asyncio
+async def test_handle_update_writes_action_log_for_task_execution() -> None:
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        session.add(User(telegram_user_id="99", display_name="Jiaxin"))
+        session.commit()
+
+    planner = FakePlanner(
+        PlannedConversation(
+            actions=[
+                {
+                    "action_type": "create_task",
+                    "payload": {
+                        "title": "给导师发邮件",
+                        "semantic_type": "explicit_time",
+                        "due_at": "2026-03-28T15:00:00-07:00",
+                    },
+                }
+            ]
+        )
+    )
+    task_command_service = FakeTaskCommandService("好，我已经替你记进 TickTick 了：周六 15:00 给导师发邮件")
+    service = ConversationService(
+        planner=planner,
+        task_command_service=task_command_service,
+        session_factory=session_factory,
+        memory_service=MemoryService(session_factory=session_factory),
+    )
+    update = TelegramUpdate.model_validate(
+        {
+            "update_id": 5_1,
+            "message": {
+                "message_id": 11_1,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "明天下午3点提醒我给导师发邮件",
+            },
+        }
+    )
+
+    replies = await service.handle_update(update)
+
+    assert len(replies) == 1
+    with session_factory() as session:
+        row = session.query(ActionLog).one()
+
+    assert row.source_message_id == "111"
+    assert row.original_text == "明天下午3点提醒我给导师发邮件"
+    assert row.status == "task_action"
+    assert row.parsed_plan_json["actions"][0]["action_type"] == "create_task"
+    assert row.execution_result_json["reply_texts"] == ["好，我已经替你记进 TickTick 了：周六 15:00 给导师发邮件"]
+
+
+@pytest.mark.asyncio
+async def test_handle_update_writes_action_log_for_confirmation_pending() -> None:
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        session.add(User(telegram_user_id="99", display_name="Jiaxin"))
+        session.commit()
+
+    planner = FakePlanner(
+        PlannedConversation(
+            actions=[],
+            requires_confirmation=True,
+            assistant_reply="你是指周二那条，还是周三那条？",
+        )
+    )
+    service = ConversationService(
+        planner=planner,
+        session_factory=session_factory,
+        memory_service=MemoryService(session_factory=session_factory),
+    )
+    update = TelegramUpdate.model_validate(
+        {
+            "update_id": 5_2,
+            "message": {
+                "message_id": 112,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "改到明天下午",
+            },
+        }
+    )
+
+    replies = await service.handle_update(update)
+
+    assert [reply.text for reply in replies] == ["你是指周二那条，还是周三那条？"]
+    with session_factory() as session:
+        row = session.query(ActionLog).one()
+
+    assert row.status == "confirmation_pending"
+    assert row.parsed_plan_json["requires_confirmation"] is True
+    assert row.execution_result_json["reply_texts"] == ["你是指周二那条，还是周三那条？"]
 
 
 @pytest.mark.asyncio

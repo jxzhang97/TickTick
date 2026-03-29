@@ -6,6 +6,7 @@ import re
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session, sessionmaker
 
+from ticktick_telegram_assistant.db.models.action_log import ActionLog
 from ticktick_telegram_assistant.db.models.reminder_event import ReminderEvent
 from ticktick_telegram_assistant.db.models.task_shadow import TaskShadow
 from ticktick_telegram_assistant.db.models.user import User
@@ -17,6 +18,7 @@ from ticktick_telegram_assistant.domain.schemas import (
     TelegramReply,
 )
 from ticktick_telegram_assistant.integrations.openai_planner import OpenAIPlanner
+from ticktick_telegram_assistant.repositories.action_logs import ActionLogRepository
 from ticktick_telegram_assistant.repositories.reminders import ReminderRepository
 from ticktick_telegram_assistant.repositories.users import UserRepository
 from ticktick_telegram_assistant.services.conflict_detector import ConflictDetector
@@ -88,7 +90,22 @@ class ConversationService:
         self._active_task_contexts: dict[str, dict[str, str]] = {}
 
     async def handle_update(self, update: TelegramUpdate) -> list[TelegramReply]:
-        return await self._handle_update(update)
+        trace: dict[str, object] = {"status": "noop"}
+        try:
+            replies = await self._handle_update(update, trace=trace)
+        except Exception as exc:
+            self._write_action_log(
+                update=update,
+                trace={
+                    "status": "error",
+                    "parsed_plan_json": trace.get("parsed_plan_json"),
+                    "execution_result_json": {"error": str(exc)},
+                },
+                replies=[],
+            )
+            raise
+        self._write_action_log(update=update, trace=trace, replies=replies)
+        return replies
 
     async def _handle_update(
         self,
@@ -96,11 +113,14 @@ class ConversationService:
         *,
         skip_pending_contexts: bool = False,
         skip_multiline_batch: bool = False,
+        trace: dict[str, object] | None = None,
     ) -> list[TelegramReply]:
         if update.message is None:
             return []
         location_reply = await self._maybe_handle_location_update(update)
         if location_reply is not None:
+            if trace is not None:
+                trace["status"] = "location_updated"
             return [location_reply]
         if update.message.text is None:
             return []
@@ -110,33 +130,49 @@ class ConversationService:
         )
         timezone_text_reply = await self._maybe_handle_timezone_text_update(update)
         if timezone_text_reply is not None:
+            if trace is not None:
+                trace["status"] = "timezone_updated"
             return [timezone_text_reply]
         snooze_reply = await self._maybe_handle_snooze_request(update)
         if snooze_reply is not None:
+            if trace is not None:
+                trace["status"] = "snoozed"
             return [snooze_reply]
         if not skip_pending_contexts:
             confirmation_reply = await self._maybe_handle_pending_confirmation(update)
             if confirmation_reply is not None:
+                if trace is not None:
+                    trace["status"] = "confirmation_resolved"
                 return [confirmation_reply]
             query_reply = await self._maybe_handle_pending_query(update)
             if query_reply is not None:
+                if trace is not None:
+                    trace["status"] = "query_follow_up"
                 return [query_reply]
         if not skip_multiline_batch:
             batch_replies = await self._maybe_handle_multiline_batch(update)
             if batch_replies is not None:
+                if trace is not None:
+                    trace["status"] = "batch_completed"
                 return batch_replies
         if self._is_evening_review_reply(update.message.text):
+            if trace is not None:
+                trace["status"] = "evening_review"
             return await self._handle_evening_review_reply(
                 telegram_user_id=self._telegram_user_id(update),
                 chat_id=update.message.chat.id,
                 text=update.message.text,
                 current_timezone=self._current_timezone_for_update(update),
-            )
+        )
         memo_cleanup_reply = await self._maybe_handle_memo_cleanup_reply(update)
         if memo_cleanup_reply is not None:
+            if trace is not None:
+                trace["status"] = "memo_cleanup"
             return [memo_cleanup_reply]
         ticktick_reply = await self._maybe_build_ticktick_reply(update)
         if ticktick_reply is not None:
+            if trace is not None:
+                trace["status"] = "ticktick_reply"
             return [ticktick_reply]
         telegram_user_id = self._telegram_user_id(update)
         resolved_text = self._resolve_follow_up_text(
@@ -150,11 +186,14 @@ class ConversationService:
             current_timezone=current_timezone,
         )
         planned = await self._planner.plan(context)
+        if trace is not None:
+            trace["parsed_plan_json"] = planned.model_dump(mode="json")
         action_reply = await self._maybe_execute_planned_actions(
             update=update,
             planned=planned,
             telegram_user_id=telegram_user_id,
             context=context,
+            trace=trace,
         )
         if action_reply is not None:
             return [action_reply]
@@ -163,6 +202,8 @@ class ConversationService:
             telegram_user_id=telegram_user_id,
             reply_text=reply_text,
         )
+        if trace is not None:
+            trace["status"] = "assistant_reply"
         return [TelegramReply(chat_id=update.message.chat.id, text=reply_text)]
 
     async def update_user_timezone(self, *, user_id: int, timezone_name: str, source: str) -> None:
@@ -392,10 +433,13 @@ class ConversationService:
         telegram_user_id: str | None,
         context: ConversationContext,
         allow_non_ticktick_request: bool = False,
+        trace: dict[str, object] | None = None,
     ) -> TelegramReply | None:
         if planned.requires_confirmation:
             if update.message is None or telegram_user_id is None:
                 return None
+            if trace is not None:
+                trace["status"] = "confirmation_pending"
             return self._save_planner_confirmation(
                 update=update,
                 telegram_user_id=telegram_user_id,
@@ -432,6 +476,8 @@ class ConversationService:
             action=action,
         )
         self._store_active_task_context(telegram_user_id=telegram_user_id, action=action)
+        if trace is not None:
+            trace["status"] = "task_action"
         self._record_successful_action_memory(
             telegram_user_id=telegram_user_id,
             action=action,
@@ -1902,6 +1948,40 @@ class ConversationService:
             memory_type=MemoryType.PREFERENCE,
             source_type="system",
         )
+
+    def _write_action_log(
+        self,
+        *,
+        update: TelegramUpdate,
+        trace: dict[str, object],
+        replies: list[TelegramReply],
+    ) -> None:
+        if self._session_factory is None or update.message is None or update.message.text is None:
+            return
+        telegram_user_id = self._telegram_user_id(update)
+        if telegram_user_id is None:
+            return
+        reply_texts = [reply.text for reply in replies]
+        execution_result_json = trace.get("execution_result_json")
+        if not isinstance(execution_result_json, dict):
+            execution_result_json = {"reply_texts": reply_texts}
+        elif reply_texts and "reply_texts" not in execution_result_json:
+            execution_result_json = {**execution_result_json, "reply_texts": reply_texts}
+        status = str(trace.get("status") or "completed")
+        parsed_plan_json = trace.get("parsed_plan_json")
+        with self._session_factory() as session:
+            user = UserRepository(session).get_or_create(telegram_user_id=telegram_user_id)
+            ActionLogRepository(session).add(
+                ActionLog(
+                    user_id=user.id,
+                    source_message_id=str(update.message.message_id),
+                    original_text=update.message.text,
+                    parsed_plan_json=parsed_plan_json if isinstance(parsed_plan_json, dict) else None,
+                    execution_result_json=execution_result_json,
+                    status=status,
+                )
+            )
+            session.commit()
 
 
 class NoopConversationService(ConversationService):
