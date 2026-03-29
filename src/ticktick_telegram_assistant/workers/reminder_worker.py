@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 import math
 from zoneinfo import ZoneInfo
 
@@ -14,9 +14,13 @@ from ticktick_telegram_assistant.repositories.task_shadows import TaskShadowRepo
 from ticktick_telegram_assistant.repositories.users import UserRepository
 from ticktick_telegram_assistant.services.briefing_service import BriefingService
 from ticktick_telegram_assistant.services.message_renderer import MessageRenderer
+from ticktick_telegram_assistant.services.today_brief_service import TodayBriefService
 
 
 class ReminderWorker:
+    _MORNING_BRIEF_CATCHUP = timedelta(hours=4)
+    _EVENING_REVIEW_CATCHUP = timedelta(hours=3)
+
     def __init__(
         self,
         *,
@@ -25,12 +29,23 @@ class ReminderWorker:
         telegram_client=None,
         briefing_service: BriefingService | None = None,
         renderer: MessageRenderer | None = None,
+        today_brief_service: TodayBriefService | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._ticktick_client = ticktick_client
         self._telegram_client = telegram_client
         self._briefing_service = briefing_service or BriefingService()
         self._renderer = renderer or MessageRenderer()
+        self._today_brief_service = today_brief_service or (
+            TodayBriefService(
+                session_factory=session_factory,
+                ticktick_client=ticktick_client,
+                briefing_service=self._briefing_service,
+                renderer=self._renderer,
+            )
+            if session_factory is not None and ticktick_client is not None
+            else None
+        )
 
     async def run_once(self, *, now: datetime | None = None) -> None:
         if self._session_factory is None or self._ticktick_client is None or self._telegram_client is None:
@@ -53,14 +68,15 @@ class ReminderWorker:
         tasks = await self._ticktick_client.list_tasks(access_token=user.ticktick_access_token, since=None)
         task_lines = self._build_task_lines(tasks=tasks, timezone_name=timezone_name)
 
-        if self._is_trigger_time(local_now, hour=8, minute=0):
-            text = self._build_morning_brief(user=user, local_now=local_now, task_lines=task_lines)
+        morning_schedule = self._resolve_morning_brief_schedule(local_now=local_now)
+        if morning_schedule is not None and self._today_brief_service is not None:
+            text = await self._today_brief_service.build_today_brief_for_user(user=user, now=local_now, tasks=tasks)
             if text:
                 await self._send_once(
                     user=user,
-                    dedupe_key=f"morning_brief:{local_now.date().isoformat()}",
+                    dedupe_key=f"morning_brief:{morning_schedule.date().isoformat()}",
                     event_type="morning_brief",
-                    scheduled_at=local_now.replace(hour=8, minute=0, second=0, microsecond=0),
+                    scheduled_at=morning_schedule,
                     text=text,
                     now=now,
                 )
@@ -69,21 +85,26 @@ class ReminderWorker:
         await self._send_windowed_reminders(user=user, local_now=local_now, now=now)
         await self._send_weekly_memo_cleanup(user=user, local_now=local_now, now=now)
 
-        if self._is_trigger_time(local_now, hour=23, minute=30):
-            text = self._build_evening_review(local_now=local_now, task_lines=task_lines)
+        evening_schedule = self._resolve_evening_review_schedule(local_now=local_now)
+        if evening_schedule is not None:
+            scheduled_at, review_date = evening_schedule
+            candidates = self._build_evening_review_candidates(
+                review_date=review_date,
+                task_lines=task_lines,
+            )
+            if review_date != local_now.date() and not candidates:
+                return
+            text = self._build_evening_review(review_date=review_date, task_lines=task_lines)
             if text:
                 await self._send_once(
                     user=user,
-                    dedupe_key=f"evening_review:{local_now.date().isoformat()}",
+                    dedupe_key=f"evening_review:{review_date.isoformat()}",
                     event_type="evening_review",
-                    scheduled_at=local_now.replace(hour=23, minute=30, second=0, microsecond=0),
+                    scheduled_at=scheduled_at,
                     text=text,
                     payload_json={
                         "text": text,
-                        "candidate_tasks": self._build_evening_review_candidates(
-                            local_now=local_now,
-                            task_lines=task_lines,
-                        ),
+                        "candidate_tasks": candidates,
                     },
                     now=now,
                 )
@@ -127,46 +148,14 @@ class ReminderWorker:
                 },
             )
 
-    def _build_morning_brief(
-        self,
-        *,
-        user: User,
-        local_now: datetime,
-        task_lines: list[dict],
-    ) -> str:
-        today = local_now.date()
-        scheduled_items = [item for item in task_lines if item["date"] == today.isoformat()]
-        scheduled_items.sort(key=lambda item: item["sort_key"])
-        ddl_items = [
-            item
-            for item in task_lines
-            if today < datetime.fromisoformat(item["date"]).date() <= today + timedelta(days=7)
-        ]
-        ddl_items.sort(key=lambda item: item["sort_key"])
-
-        with self._session_factory() as session:
-            windowed_items = self._build_windowed_items(
-                user_id=user.id,
-                local_now=local_now,
-                task_shadow_repo=TaskShadowRepository(session),
-            )
-
-        top_items = scheduled_items[:3] if scheduled_items else ddl_items[:3]
-        return self._briefing_service.render_morning_brief(
-            top_items=top_items,
-            scheduled_items=scheduled_items[:8],
-            ddl_items=ddl_items[:8],
-            windowed_items=windowed_items,
-        )
-
-    def _build_evening_review(self, *, local_now: datetime, task_lines: list[dict]) -> str | None:
-        today_items = [item for item in task_lines if item["date"] == local_now.date().isoformat()]
-        today_items.sort(key=lambda item: item["sort_key"])
-        if not today_items:
+    def _build_evening_review(self, *, review_date: date, task_lines: list[dict]) -> str | None:
+        review_items = [item for item in task_lines if item["date"] == review_date.isoformat()]
+        review_items.sort(key=lambda item: item["sort_key"])
+        if not review_items:
             return "今天快结束啦。我这边没看到明确落在今天的安排；如果有想顺手收尾的事，也可以直接跟我说。"
 
         lines = ["一天快收尾啦。今天这些事哪些已经做完了？"]
-        for item in today_items[:8]:
+        for item in review_items[:8]:
             lines.append(f"- {self._renderer.render_task_line(item)}")
         lines.append("你直接回我“前两个做完了”或者“第三个改到明天下午”就行。")
         return "\n".join(lines)
@@ -290,40 +279,12 @@ class ReminderWorker:
             },
         )
 
-    def _build_windowed_items(
-        self,
-        *,
-        user_id: int,
-        local_now: datetime,
-        task_shadow_repo: TaskShadowRepository,
-    ) -> list[dict]:
-        items: list[dict] = []
-        for shadow in task_shadow_repo.list_windowed_by_user(user_id=user_id):
-            if shadow.window_end is None:
-                continue
-            if shadow.window_end.date() < local_now.date():
-                continue
-            if shadow.window_start is not None and shadow.window_start.date() > (local_now.date() + timedelta(days=7)):
-                continue
-            items.append(
-                {
-                    "date": (shadow.window_end.date().isoformat()),
-                    "sort_key": shadow.window_end,
-                    "weekday": self._renderer.render_weekday(shadow.window_end),
-                    "when": shadow.raw_nl_time or "时间窗口",
-                    "title": shadow.normalized_title or "待推进事项",
-                    "description": None,
-                }
-            )
-        items.sort(key=lambda item: item["sort_key"])
-        return items[:8]
-
-    def _build_evening_review_candidates(self, *, local_now: datetime, task_lines: list[dict]) -> list[dict[str, str]]:
-        today_items = [item for item in task_lines if item["date"] == local_now.date().isoformat()]
-        today_items.sort(key=lambda item: item["sort_key"])
+    def _build_evening_review_candidates(self, *, review_date: date, task_lines: list[dict]) -> list[dict[str, str]]:
+        review_items = [item for item in task_lines if item["date"] == review_date.isoformat()]
+        review_items.sort(key=lambda item: item["sort_key"])
         return [
             {"task_id": str(item["task_id"]), "title": str(item["title"])}
-            for item in today_items[:8]
+            for item in review_items[:8]
             if item.get("task_id") and item.get("title")
         ]
 
@@ -376,6 +337,26 @@ class ReminderWorker:
         scheduled = current_time.replace(hour=hour, minute=minute, second=0, microsecond=0)
         delta = (current_time - scheduled).total_seconds()
         return 0 <= delta < grace_seconds
+
+    def _resolve_morning_brief_schedule(self, *, local_now: datetime) -> datetime | None:
+        scheduled = local_now.replace(hour=8, minute=0, second=0, microsecond=0)
+        if scheduled <= local_now < scheduled + self._MORNING_BRIEF_CATCHUP:
+            return scheduled
+        return None
+
+    def _resolve_evening_review_schedule(self, *, local_now: datetime) -> tuple[datetime, date] | None:
+        same_day_scheduled = local_now.replace(hour=23, minute=30, second=0, microsecond=0)
+        if same_day_scheduled <= local_now < same_day_scheduled + self._EVENING_REVIEW_CATCHUP:
+            return same_day_scheduled, local_now.date()
+
+        if local_now.timetz().replace(tzinfo=None) >= time(2, 30):
+            return None
+
+        previous_date = local_now.date() - timedelta(days=1)
+        previous_scheduled = datetime.combine(previous_date, time(23, 30), tzinfo=local_now.tzinfo)
+        if previous_scheduled <= local_now < previous_scheduled + self._EVENING_REVIEW_CATCHUP:
+            return previous_scheduled, previous_date
+        return None
 
     def _windowed_checkpoints(self, *, shadow, timezone_name: str) -> list[tuple[str, datetime | None]]:
         start_at = self._normalize_shadow_datetime(shadow.window_start, timezone_name=timezone_name)

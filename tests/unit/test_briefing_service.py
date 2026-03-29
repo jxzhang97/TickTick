@@ -39,3 +39,19 @@ def test_briefing_keeps_fixed_sections_and_compresses_long_lists() -> None:
     assert "这几天要推进的时间窗口任务：" in rendered
     assert "暂时没有" in rendered
     assert "其余 2 件" in rendered
+
+
+def test_briefing_keeps_fixed_sections_when_everything_is_empty() -> None:
+    service = BriefingService()
+    rendered = service.render_morning_brief(
+        top_items=[],
+        scheduled_items=[],
+        ddl_items=[],
+        windowed_items=[],
+    )
+
+    assert "今天最重要的几件：" in rendered
+    assert "今天有明确时间的安排：" in rendered
+    assert "未来 7 天的 ddl：" in rendered
+    assert "这几天要推进的时间窗口任务：" in rendered
+    assert rendered.count("暂时没有") >= 3

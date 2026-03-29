@@ -9,7 +9,9 @@ class MessageRenderer:
         note = item.get("note")
         if note:
             return str(note)
-        line = f"{item.get('weekday', '')} {item.get('when', '')} {item.get('title', '')}".strip()
+        date_label = item.get("date_label")
+        prefix = date_label or item.get("weekday", "")
+        line = f"{prefix} {item.get('when', '')} {item.get('title', '')}".strip()
         description = item.get("description")
         if description:
             line = f"{line}，{self._summarize_description(str(description))}"

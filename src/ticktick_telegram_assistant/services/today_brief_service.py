@@ -14,6 +14,8 @@ from ticktick_telegram_assistant.services.message_renderer import MessageRendere
 
 
 class TodayBriefService:
+    _TOP_ITEMS_LIMIT = 3
+
     def __init__(
         self,
         *,
@@ -29,6 +31,15 @@ class TodayBriefService:
 
     async def build_today_brief(self, *, telegram_user_id: str, now: datetime | None = None) -> str:
         user = self._get_user(telegram_user_id=telegram_user_id)
+        return await self.build_today_brief_for_user(user=user, now=now)
+
+    async def build_today_brief_for_user(
+        self,
+        *,
+        user: User | None,
+        now: datetime | None = None,
+        tasks: list[TickTickTask] | None = None,
+    ) -> str:
         if user is None or not user.ticktick_access_token:
             return "我现在还没拿到你的 TickTick 访问权限，所以还不能替你拉今天的安排。"
 
@@ -39,8 +50,14 @@ class TodayBriefService:
         else:
             current_time = current_time.astimezone(ZoneInfo(timezone_name))
 
-        tasks = await self._ticktick_client.list_tasks(access_token=user.ticktick_access_token)
-        task_lines = [item for item in (self._task_to_line(task, timezone_name=timezone_name) for task in tasks) if item is not None]
+        fetched_tasks = tasks
+        if fetched_tasks is None:
+            fetched_tasks = await self._ticktick_client.list_tasks(access_token=user.ticktick_access_token)
+        task_lines = [
+            item
+            for item in (self._task_to_line(task, timezone_name=timezone_name) for task in fetched_tasks)
+            if item is not None
+        ]
         today = current_time.date()
         scheduled_items = [item for item in task_lines if item["date"] == today.isoformat()]
         scheduled_items.sort(key=lambda item: item["sort_key"])
@@ -65,9 +82,6 @@ class TodayBriefService:
             excluded_ids=top_ids,
             fallback_note="重点都在上面了。",
         )
-
-        if not (top_items or scheduled_items or ddl_items or windowed_items):
-            return "今天在 TickTick 里我还没看到明确落在今天的安排，你可以放心一点。"
 
         return self._briefing_service.render_morning_brief(
             top_items=top_items,
@@ -148,6 +162,7 @@ class TodayBriefService:
         items.sort(key=lambda item: item["sort_key"])
         for item in items:
             item["category"] = "ddl"
+            item["date_label"] = f"{item['sort_key'].strftime('%m/%d')} {item['weekday']}"
         return items
 
     def _select_top_items(
@@ -163,7 +178,7 @@ class TodayBriefService:
             *windowed_items,
         ]
         ranked = sorted(candidates, key=self._top_sort_key)
-        return ranked[:5]
+        return ranked[: self._TOP_ITEMS_LIMIT]
 
     def _top_sort_key(self, item: dict) -> tuple[int, int, datetime]:
         category_rank = {

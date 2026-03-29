@@ -104,6 +104,99 @@ async def test_reminder_worker_sends_morning_brief_once_per_day() -> None:
 
 
 @pytest.mark.asyncio
+async def test_reminder_worker_uses_today_brief_structure_for_morning_brief() -> None:
+    from ticktick_telegram_assistant.workers.reminder_worker import ReminderWorker
+
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        session.add(
+            User(
+                telegram_user_id="99",
+                display_name="Jiaxin",
+                current_timezone="America/Los_Angeles",
+                ticktick_access_token="access-token",
+            )
+        )
+        session.commit()
+
+    ticktick_client = FakeTickTickClient(
+        [
+            TickTickTask(
+                id="t1",
+                projectId="telegram-inbox",
+                title="上午先发邮件",
+                dueDate="2026-03-29T11:00:00.000-0700",
+                priority=5,
+                status=0,
+            ),
+            TickTickTask(
+                id="t2",
+                projectId="telegram-inbox",
+                title="周三前交报告",
+                dueDate="2026-04-01T18:00:00.000-0700",
+                status=0,
+            ),
+        ]
+    )
+    telegram_client = FakeTelegramClient()
+    worker = ReminderWorker(
+        session_factory=session_factory,
+        ticktick_client=ticktick_client,
+        telegram_client=telegram_client,
+    )
+
+    await worker.run_once(now=datetime.fromisoformat("2026-03-29T08:00:10-07:00"))
+
+    assert len(telegram_client.sent_messages) == 1
+    message = telegram_client.sent_messages[0]["text"]
+    assert "今天最重要的几件：" in message
+    assert "今天有明确时间的安排：" in message
+    assert "未来 7 天的 ddl：" in message
+    assert "这几天要推进的时间窗口任务：" in message
+    assert "04/01 周三" in message
+
+
+@pytest.mark.asyncio
+async def test_reminder_worker_backfills_morning_brief_after_missed_trigger() -> None:
+    from ticktick_telegram_assistant.workers.reminder_worker import ReminderWorker
+
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        session.add(
+            User(
+                telegram_user_id="99",
+                display_name="Jiaxin",
+                current_timezone="America/Los_Angeles",
+                ticktick_access_token="access-token",
+            )
+        )
+        session.commit()
+
+    ticktick_client = FakeTickTickClient(
+        [
+            TickTickTask(
+                id="t1",
+                projectId="telegram-inbox",
+                title="补发晨报测试",
+                dueDate="2026-03-29T15:00:00.000-0700",
+                status=0,
+            )
+        ]
+    )
+    telegram_client = FakeTelegramClient()
+    worker = ReminderWorker(
+        session_factory=session_factory,
+        ticktick_client=ticktick_client,
+        telegram_client=telegram_client,
+    )
+
+    await worker.run_once(now=datetime.fromisoformat("2026-03-29T08:17:10-07:00"))
+
+    assert len(telegram_client.sent_messages) == 1
+    assert "补发晨报测试" in telegram_client.sent_messages[0]["text"]
+
+
+@pytest.mark.asyncio
 async def test_reminder_worker_morning_brief_shows_time_range_for_span_task() -> None:
     from ticktick_telegram_assistant.workers.reminder_worker import ReminderWorker
 
@@ -285,6 +378,46 @@ async def test_reminder_worker_sends_evening_review_once() -> None:
         assert reminder.payload_json["candidate_tasks"] == [
             {"task_id": "t1", "title": "周五讨论"}
         ]
+
+
+@pytest.mark.asyncio
+async def test_reminder_worker_backfills_evening_review_after_midnight_restart() -> None:
+    from ticktick_telegram_assistant.workers.reminder_worker import ReminderWorker
+
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        session.add(
+            User(
+                telegram_user_id="99",
+                display_name="Jiaxin",
+                current_timezone="America/Los_Angeles",
+                ticktick_access_token="access-token",
+            )
+        )
+        session.commit()
+
+    ticktick_client = FakeTickTickClient(
+        [
+            TickTickTask(
+                id="t1",
+                projectId="telegram-inbox",
+                title="周五讨论",
+                dueDate="2026-03-27T21:00:00.000+0000",
+                status=0,
+            )
+        ]
+    )
+    telegram_client = FakeTelegramClient()
+    worker = ReminderWorker(
+        session_factory=session_factory,
+        ticktick_client=ticktick_client,
+        telegram_client=telegram_client,
+    )
+
+    await worker.run_once(now=datetime.fromisoformat("2026-03-28T00:10:00-07:00"))
+
+    assert len(telegram_client.sent_messages) == 1
+    assert "今天这些事哪些已经做完了" in telegram_client.sent_messages[0]["text"]
 
 
 @pytest.mark.asyncio
