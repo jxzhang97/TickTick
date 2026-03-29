@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy.orm import Session, sessionmaker
 
+from ticktick_telegram_assistant.db.models.task_shadow import TaskShadow
 from ticktick_telegram_assistant.db.models.user import User
 from ticktick_telegram_assistant.integrations.ticktick_client import TickTickClient, TickTickTask
 from ticktick_telegram_assistant.repositories.task_shadows import TaskShadowRepository
@@ -53,149 +54,224 @@ class TodayBriefService:
         fetched_tasks = tasks
         if fetched_tasks is None:
             fetched_tasks = await self._ticktick_client.list_tasks(access_token=user.ticktick_access_token)
-        task_lines = [
+        today = current_time.date()
+        windowed_shadows, memo_shadows = self._load_shadow_groups(user_id=user.id)
+        windowed_task_ids = {shadow.ticktick_task_id for shadow in windowed_shadows}
+        memo_task_ids = {shadow.ticktick_task_id for shadow in memo_shadows}
+        task_records = [
             item
-            for item in (self._task_to_line(task, timezone_name=timezone_name) for task in fetched_tasks)
+            for item in (
+                self._task_to_record(
+                    task,
+                    timezone_name=timezone_name,
+                    windowed_task_ids=windowed_task_ids,
+                    memo_task_ids=memo_task_ids,
+                )
+                for task in fetched_tasks
+            )
             if item is not None
         ]
-        today = current_time.date()
-        scheduled_items = [item for item in task_lines if item["date"] == today.isoformat()]
-        scheduled_items.sort(key=lambda item: item["sort_key"])
-        for item in scheduled_items:
-            item["category"] = "scheduled"
-        windowed_items = self._build_windowed_items(user=user, current_time=current_time, timezone_name=timezone_name)
-        ddl_items = self._build_deadline_items(task_lines=task_lines, today=today)
-        top_items = self._select_top_items(
-            scheduled_items=scheduled_items,
-            ddl_items=ddl_items,
-            windowed_items=windowed_items,
+        tasks_by_id = {task.id: task for task in fetched_tasks if task.status != 2 and not task.completed}
+
+        today_timed_items = sorted(
+            [
+                item
+                for item in task_records
+                if item["semantic_type"] != "windowed"
+                and item["date_obj"] == today
+                and not item["is_all_day"]
+            ],
+            key=lambda item: item["sort_key"],
         )
-        top_ids = {item.get("task_id") for item in top_items if item.get("task_id")}
-        scheduled_detail_items = self._build_detail_section(
-            items=scheduled_items,
-            excluded_ids=top_ids,
-            fallback_note="重点都在上面了。",
+        today_date_only_items = sorted(
+            [
+                item
+                for item in task_records
+                if item["semantic_type"] != "windowed"
+                and item["date_obj"] == today
+                and item["is_all_day"]
+            ],
+            key=lambda item: item["sort_key"],
         )
-        ddl_detail_items = ddl_items
-        windowed_detail_items = self._build_detail_section(
-            items=windowed_items,
-            excluded_ids=top_ids,
-            fallback_note="重点都在上面了。",
+        overdue_items = sorted(
+            [
+                item
+                for item in task_records
+                if item["semantic_type"] != "windowed"
+                and item["date_obj"] is not None
+                and item["date_obj"] < today
+            ],
+            key=lambda item: item["sort_key"],
+        )
+        upcoming_explicit_items = sorted(
+            [
+                item
+                for item in task_records
+                if item["semantic_type"] != "windowed"
+                and item["date_obj"] is not None
+                and today < item["date_obj"] <= today + timedelta(days=7)
+            ],
+            key=lambda item: item["sort_key"],
+        )
+        active_windowed_items, upcoming_windowed_items = self._build_windowed_items(
+            windowed_shadows=windowed_shadows,
+            tasks_by_id=tasks_by_id,
+            current_time=current_time,
+        )
+        memo_items = self._build_memo_items(
+            task_records=task_records,
+            memo_shadows=memo_shadows,
+            tasks_by_id=tasks_by_id,
         )
 
         return self._briefing_service.render_morning_brief(
-            top_items=top_items,
-            scheduled_items=scheduled_detail_items,
-            ddl_items=ddl_detail_items,
-            windowed_items=windowed_detail_items,
+            current_time=current_time,
+            today_timed_items=today_timed_items,
+            today_date_only_items=today_date_only_items,
+            active_windowed_items=active_windowed_items,
+            overdue_items=overdue_items,
+            upcoming_explicit_items=upcoming_explicit_items,
+            upcoming_windowed_items=upcoming_windowed_items,
+            memo_items=memo_items,
         )
 
     def _get_user(self, *, telegram_user_id: str) -> User | None:
         with self._session_factory() as session:
             return session.query(User).filter(User.telegram_user_id == telegram_user_id).one_or_none()
 
-    def _task_to_line(self, task: TickTickTask, *, timezone_name: str) -> dict | None:
+    def _task_to_record(
+        self,
+        task: TickTickTask,
+        *,
+        timezone_name: str,
+        windowed_task_ids: set[str],
+        memo_task_ids: set[str],
+    ) -> dict | None:
         if task.status == 2 or task.completed:
             return None
 
         start_dt = self._parse_ticktick_datetime(task.startDate, timezone_name=timezone_name)
         due_dt = self._parse_ticktick_datetime(task.dueDate, timezone_name=timezone_name)
         effective_dt = start_dt or due_dt
-        if effective_dt is None:
-            return None
-
         description = task.desc or task.content or None
+        semantic_type = self._infer_semantic_type(
+            task=task,
+            effective_dt=effective_dt,
+            windowed_task_ids=windowed_task_ids,
+            memo_task_ids=memo_task_ids,
+        )
         if task.isAllDay:
-            when = "今天"
+            time_label = "全天"
         elif start_dt is not None and due_dt is not None and due_dt > start_dt:
-            when = f"{start_dt.strftime('%H:%M')}-{due_dt.strftime('%H:%M')}"
+            time_label = f"{start_dt.strftime('%H:%M')}-{due_dt.strftime('%H:%M')}"
+        elif effective_dt is not None:
+            time_label = effective_dt.strftime("%H:%M")
         else:
-            when = effective_dt.strftime("%H:%M")
+            time_label = ""
         return {
             "task_id": task.id,
-            "date": effective_dt.date().isoformat(),
-            "date_obj": effective_dt.date(),
-            "sort_key": effective_dt,
-            "weekday": self._renderer.render_weekday(effective_dt),
-            "when": when,
+            "date": effective_dt.date().isoformat() if effective_dt is not None else None,
+            "date_obj": effective_dt.date() if effective_dt is not None else None,
+            "sort_key": effective_dt or datetime.max.replace(tzinfo=ZoneInfo(timezone_name)),
+            "weekday": self._renderer.render_weekday(effective_dt) if effective_dt is not None else None,
+            "when": time_label,
+            "time_label": time_label,
             "title": task.title,
             "description": description,
             "priority": task.priority or 0,
+            "is_all_day": bool(task.isAllDay),
             "is_time_span": bool(start_dt is not None and due_dt is not None and due_dt > start_dt),
-            "category": "future",
+            "semantic_type": semantic_type,
+            "start_dt": start_dt,
+            "due_dt": due_dt,
+            "effective_dt": effective_dt,
         }
 
-    def _build_windowed_items(self, *, user: User, current_time: datetime, timezone_name: str) -> list[dict]:
-        items: list[dict] = []
+    def _load_shadow_groups(self, *, user_id: int) -> tuple[list[TaskShadow], list[TaskShadow]]:
         with self._session_factory() as session:
-            for shadow in TaskShadowRepository(session).list_windowed_by_user(user_id=user.id):
-                if shadow.window_end is None:
-                    continue
-                if shadow.window_end.date() < current_time.date():
-                    continue
-                if shadow.window_start is not None and shadow.window_start.date() > (current_time.date() + timedelta(days=7)):
-                    continue
-                items.append(
-                    {
-                        "task_id": shadow.ticktick_task_id,
-                        "date": shadow.window_end.date().isoformat(),
-                        "date_obj": shadow.window_end.date(),
-                        "sort_key": shadow.window_end,
-                        "weekday": self._renderer.render_weekday(shadow.window_end),
-                        "when": shadow.raw_nl_time or "时间窗口",
-                        "title": shadow.normalized_title or "待推进事项",
-                        "description": None,
-                        "priority": 0,
-                        "is_time_span": False,
-                        "category": "windowed",
-                    }
-                )
-        items.sort(key=lambda item: item["sort_key"])
-        return items[:8]
+            repository = TaskShadowRepository(session)
+            return repository.list_windowed_by_user(user_id=user_id), repository.list_memo_by_user(user_id=user_id)
 
-    def _build_deadline_items(self, *, task_lines: list[dict], today) -> list[dict]:
-        items = [
-            item
-            for item in task_lines
-            if today < item["date_obj"] <= today + timedelta(days=7) and not item.get("is_time_span")
-        ]
-        items.sort(key=lambda item: item["sort_key"])
-        for item in items:
-            item["category"] = "ddl"
-            item["date_label"] = f"{item['sort_key'].strftime('%m/%d')} {item['weekday']}"
-        return items
-
-    def _select_top_items(
+    def _build_windowed_items(
         self,
         *,
-        scheduled_items: list[dict],
-        ddl_items: list[dict],
-        windowed_items: list[dict],
+        windowed_shadows: list[TaskShadow],
+        tasks_by_id: dict[str, TickTickTask],
+        current_time: datetime,
+    ) -> tuple[list[dict], list[dict]]:
+        active_items: list[dict] = []
+        upcoming_items: list[dict] = []
+        today = current_time.date()
+        horizon = today + timedelta(days=7)
+        for shadow in windowed_shadows:
+            if shadow.window_end is None:
+                continue
+            if shadow.window_end.date() < today:
+                continue
+            start_date = shadow.window_start.date() if shadow.window_start is not None else today
+            task = tasks_by_id.get(shadow.ticktick_task_id)
+            item = {
+                "task_id": shadow.ticktick_task_id,
+                "title": task.title if task is not None else (shadow.normalized_title or "待推进事项"),
+                "description": (task.desc or task.content or None) if task is not None else None,
+                "window_start": shadow.window_start,
+                "window_end": shadow.window_end,
+                "raw_nl_time": shadow.raw_nl_time,
+                "sort_key": shadow.window_start or shadow.window_end,
+            }
+            if start_date <= today <= shadow.window_end.date():
+                active_items.append(item)
+            elif today < start_date <= horizon:
+                upcoming_items.append(item)
+        active_items.sort(key=lambda item: item["sort_key"])
+        upcoming_items.sort(key=lambda item: item["sort_key"])
+        return active_items[:8], upcoming_items[:8]
+
+    def _build_memo_items(
+        self,
+        *,
+        task_records: list[dict],
+        memo_shadows: list[TaskShadow],
+        tasks_by_id: dict[str, TickTickTask],
     ) -> list[dict]:
-        candidates = [
-            *scheduled_items,
-            *ddl_items,
-            *windowed_items,
-        ]
-        ranked = sorted(candidates, key=self._top_sort_key)
-        return ranked[: self._TOP_ITEMS_LIMIT]
+        items: list[dict] = []
+        seen_task_ids: set[str] = set()
+        for item in task_records:
+            if item["semantic_type"] != "memo":
+                continue
+            items.append(item)
+            seen_task_ids.add(item["task_id"])
+        for shadow in memo_shadows:
+            if shadow.ticktick_task_id in seen_task_ids:
+                continue
+            task = tasks_by_id.get(shadow.ticktick_task_id)
+            items.append(
+                {
+                    "task_id": shadow.ticktick_task_id,
+                    "title": task.title if task is not None else (shadow.normalized_title or "待整理备忘"),
+                    "description": (task.desc or task.content or None) if task is not None else None,
+                    "semantic_type": "memo",
+                    "sort_key": datetime.max.replace(tzinfo=ZoneInfo("UTC")),
+                }
+            )
+        items.sort(key=lambda item: (-(item.get("priority") or 0), item.get("title") or ""))
+        return items[:8]
 
-    def _top_sort_key(self, item: dict) -> tuple[int, int, datetime]:
-        category_rank = {
-            "scheduled": 0,
-            "ddl": 1,
-            "windowed": 2,
-        }.get(item.get("category"), 3)
-        priority = -(item.get("priority") or 0)
-        return (category_rank, priority, item["sort_key"])
-
-    def _build_detail_section(self, *, items: list[dict], excluded_ids: set[str], fallback_note: str) -> list[dict]:
-        detail_items = [item for item in items if item.get("task_id") not in excluded_ids]
-        if detail_items:
-            return detail_items
-        if items:
-            return [{"note": fallback_note}]
-        return []
+    def _infer_semantic_type(
+        self,
+        *,
+        task: TickTickTask,
+        effective_dt: datetime | None,
+        windowed_task_ids: set[str],
+        memo_task_ids: set[str],
+    ) -> str:
+        if task.id in windowed_task_ids:
+            return "windowed"
+        if task.id in memo_task_ids:
+            return "memo"
+        if effective_dt is None:
+            return "memo"
+        return "explicit_time"
 
     def _parse_ticktick_datetime(self, raw: str | None, *, timezone_name: str) -> datetime | None:
         if not raw:

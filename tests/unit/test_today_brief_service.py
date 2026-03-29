@@ -9,51 +9,17 @@ from sqlalchemy.orm import Session, sessionmaker
 from ticktick_telegram_assistant.db.base import Base
 from ticktick_telegram_assistant.db.models.task_shadow import TaskShadow
 from ticktick_telegram_assistant.db.models.user import User
-from ticktick_telegram_assistant.integrations.ticktick_client import (
-    TickTickProject,
-    TickTickProjectData,
-    TickTickTask,
-)
+from ticktick_telegram_assistant.integrations.ticktick_client import TickTickTask
 
 
 class FakeTickTickClient:
-    def __init__(self) -> None:
+    def __init__(self, tasks: list[TickTickTask]) -> None:
+        self.tasks = tasks
         self.calls: list[dict] = []
 
     async def list_tasks(self, *, access_token: str, since=None) -> list[TickTickTask]:
         self.calls.append({"method": "list_tasks", "access_token": access_token, "since": since})
-        return [
-            TickTickTask(
-                id="t1",
-                projectId="p1",
-                title="11 点前发邮件",
-                desc="回导师",
-                dueDate="2026-03-27T18:00:00+0000",
-                status=0,
-            ),
-            TickTickTask(
-                id="t2",
-                projectId="p1",
-                title="下午发周报给产品组",
-                desc="别忘了补结论",
-                dueDate="2026-03-30T18:00:00+0000",
-                status=0,
-            ),
-            TickTickTask(
-                id="t3",
-                projectId="p1",
-                title="一周内整理实验记录",
-                dueDate="2026-04-02T18:00:00+0000",
-                status=0,
-            ),
-            TickTickTask(
-                id="t4",
-                projectId="p1",
-                title="更远的 ddl",
-                dueDate="2026-04-10T18:00:00+0000",
-                status=0,
-            ),
-        ]
+        return self.tasks
 
 
 def make_session_factory() -> sessionmaker[Session]:
@@ -62,24 +28,82 @@ def make_session_factory() -> sessionmaker[Session]:
     return sessionmaker(bind=engine, class_=Session, expire_on_commit=False)
 
 
+def add_user(session: Session) -> User:
+    user = User(
+        telegram_user_id="99",
+        display_name="Jiaxin",
+        current_timezone="America/Los_Angeles",
+        ticktick_access_token="access-token",
+    )
+    session.add(user)
+    session.flush()
+    return user
+
+
 @pytest.mark.asyncio
-async def test_build_today_brief_renders_today_items_in_user_timezone() -> None:
+async def test_build_today_brief_renders_explicit_date_anchor_and_separates_today_buckets() -> None:
     from ticktick_telegram_assistant.services.today_brief_service import TodayBriefService
+
+    tasks = [
+        TickTickTask(
+            id="overdue-1",
+            projectId="p1",
+            title="昨天没交的报告",
+            desc="先补结论",
+            dueDate="2026-03-26T18:00:00-0700",
+            status=0,
+        ),
+        TickTickTask(
+            id="today-timed-1",
+            projectId="p1",
+            title="上午先发邮件",
+            desc="发给导师",
+            startDate="2026-03-27T09:00:00-0700",
+            dueDate="2026-03-27T09:30:00-0700",
+            status=0,
+        ),
+        TickTickTask(
+            id="today-date-1",
+            projectId="p1",
+            title="今天补报销",
+            desc="只要今天做掉",
+            isAllDay=True,
+            dueDate="2026-03-27T18:00:00-0700",
+            status=0,
+        ),
+        TickTickTask(
+            id="future-scheduled-1",
+            projectId="p1",
+            title="周二下午评审会",
+            desc="产品组",
+            startDate="2026-03-31T14:00:00-0700",
+            dueDate="2026-03-31T15:30:00-0700",
+            status=0,
+        ),
+        TickTickTask(
+            id="future-ddl-1",
+            projectId="p1",
+            title="周三前交报告",
+            desc="别忘了结论",
+            dueDate="2026-04-01T18:00:00-0700",
+            status=0,
+        ),
+        TickTickTask(
+            id="far-future-1",
+            projectId="p1",
+            title="更远的 ddl",
+            dueDate="2026-04-10T18:00:00-0700",
+            status=0,
+        ),
+    ]
 
     session_factory = make_session_factory()
     with session_factory() as session:
-        user = User(
-            telegram_user_id="99",
-            display_name="Jiaxin",
-            current_timezone="America/Los_Angeles",
-            ticktick_access_token="access-token",
-        )
-        session.add(user)
-        session.flush()
+        user = add_user(session)
         session.add(
             TaskShadow(
                 user_id=user.id,
-                ticktick_task_id="shadow-1",
+                ticktick_task_id="shadow-window-1",
                 semantic_type="windowed",
                 normalized_title="整理实验记录",
                 raw_nl_time="这两周",
@@ -87,11 +111,20 @@ async def test_build_today_brief_renders_today_items_in_user_timezone() -> None:
                 window_end=datetime.fromisoformat("2026-04-02T23:59:00-07:00"),
             )
         )
+        session.add(
+            TaskShadow(
+                user_id=user.id,
+                ticktick_task_id="shadow-memo-1",
+                semantic_type="memo",
+                normalized_title="回导师邮件",
+                raw_nl_time="下班后",
+            )
+        )
         session.commit()
 
     service = TodayBriefService(
         session_factory=session_factory,
-        ticktick_client=FakeTickTickClient(),
+        ticktick_client=FakeTickTickClient(tasks),
     )
 
     message = await service.build_today_brief(
@@ -99,51 +132,63 @@ async def test_build_today_brief_renders_today_items_in_user_timezone() -> None:
         now=datetime.fromisoformat("2026-03-27T09:00:00-07:00"),
     )
 
-    assert "今天最重要的几件" in message
-    assert "今天有明确时间的安排" in message
-    assert "未来 7 天的 ddl" in message
-    assert "这几天要推进的时间窗口任务" in message
+    assert "2026-03-27" in message
     assert "周五" in message
-    assert "11:00" in message
-    assert "回导师" in message
-    assert "发周报给产品组" in message
-    assert "别忘了补结论" in message
-    assert "一周内整理实验记录" in message
+    assert "今天有明确时间的任务" in message
+    assert "今天要留意的日期任务" in message
+    assert "未完成的事情提醒（需要跟进的截止项）" in message
+    assert "接下来 7 天的明确安排和截止提醒" in message
+    assert "这段时间可以找空推进的事" in message
+    assert "顺手记着的小备忘（暂未安排具体时间，记下以便后续安排）" in message
+    assert "发给导师" in message
+    assert "只要今天做掉" in message
+    assert "先补结论" in message
+    assert "别忘了结论" in message
+    assert "这两周" in message
     assert "更远的 ddl" not in message
 
+    today_timed_section = message.split("今天有明确时间的任务", 1)[1].split("今天要留意的日期任务", 1)[0]
+    today_date_only_section = message.split("今天要留意的日期任务", 1)[1].split("这段时间可以找空推进的事", 1)[0]
+    window_section = message.split("这段时间可以找空推进的事", 1)[1].split("未完成的事情提醒（需要跟进的截止项）", 1)[0]
+    overdue_section = message.split("未完成的事情提醒（需要跟进的截止项）", 1)[1].split("接下来 7 天的明确安排和截止提醒", 1)[0]
+    future_section = message.split("接下来 7 天的明确安排和截止提醒", 1)[1].split("未来 7 天里适合找空完成的事", 1)[0]
+    backlog_section = message.split("顺手记着的小备忘（暂未安排具体时间，记下以便后续安排）", 1)[1]
+
+    assert "上午先发邮件" in today_timed_section
+    assert "今天补报销" in today_date_only_section
+    assert "昨天没交的报告" in overdue_section
+    assert "周二下午评审会" in future_section
+    assert "周三前交报告" in future_section
+    assert "整理实验记录" in window_section
+    assert "回导师邮件" in backlog_section
+    assert "今天补报销" not in today_timed_section
+    assert "周二下午评审会" not in today_timed_section
+    assert "周三前交报告" not in today_timed_section
+
 
 @pytest.mark.asyncio
-async def test_build_today_brief_renders_upcoming_items_even_without_today_deadlines() -> None:
+async def test_build_today_brief_keeps_future_items_out_of_today_buckets() -> None:
     from ticktick_telegram_assistant.services.today_brief_service import TodayBriefService
 
-    class FutureOnlyClient(FakeTickTickClient):
-        async def list_tasks(self, *, access_token: str, since=None) -> list[TickTickTask]:
-            self.calls.append({"method": "list_tasks", "access_token": access_token, "since": since})
-            return [
-                TickTickTask(
-                    id="t1",
-                    projectId="p1",
-                    title="三天后开会",
-                    dueDate="2026-03-30T18:00:00+0000",
-                    status=0,
-                )
-            ]
+    tasks = [
+        TickTickTask(
+            id="future-1",
+            projectId="p1",
+            title="三天后开会",
+            desc="产品组",
+            dueDate="2026-03-30T18:00:00-0700",
+            status=0,
+        )
+    ]
 
     session_factory = make_session_factory()
     with session_factory() as session:
-        session.add(
-            User(
-                telegram_user_id="99",
-                display_name="Jiaxin",
-                current_timezone="America/Los_Angeles",
-                ticktick_access_token="access-token",
-            )
-        )
+        add_user(session)
         session.commit()
 
     service = TodayBriefService(
         session_factory=session_factory,
-        ticktick_client=FutureOnlyClient(),
+        ticktick_client=FakeTickTickClient(tasks),
     )
 
     message = await service.build_today_brief(
@@ -151,236 +196,57 @@ async def test_build_today_brief_renders_upcoming_items_even_without_today_deadl
         now=datetime.fromisoformat("2026-03-27T09:00:00-07:00"),
     )
 
-    assert "今天最重要的几件" in message
-    assert "三天后开会" in message
+    assert "接下来 7 天的明确安排和截止提醒" in message
+    future_section = message.split("接下来 7 天的明确安排和截止提醒", 1)[1].split("未来 7 天里适合找空完成的事", 1)[0]
+    assert "三天后开会" in future_section
+
+    today_timed_section = message.split("今天有明确时间的任务", 1)[1].split("今天要留意的日期任务", 1)[0]
+    today_date_only_section = message.split("今天要留意的日期任务", 1)[1].split("这段时间可以找空推进的事", 1)[0]
+    assert "三天后开会" not in today_timed_section
+    assert "三天后开会" not in today_date_only_section
 
 
 @pytest.mark.asyncio
-async def test_build_today_brief_excludes_future_span_tasks_from_deadline_section() -> None:
+async def test_build_today_brief_renders_memo_backlog_and_window_sections_even_without_task_lists() -> None:
     from ticktick_telegram_assistant.services.today_brief_service import TodayBriefService
-
-    class MixedFutureClient(FakeTickTickClient):
-        async def list_tasks(self, *, access_token: str, since=None) -> list[TickTickTask]:
-            self.calls.append({"method": "list_tasks", "access_token": access_token, "since": since})
-            return [
-                TickTickTask(
-                    id="span-1",
-                    projectId="p1",
-                    title="周二下午评审会",
-                    startDate="2026-03-31T14:00:00-0700",
-                    dueDate="2026-03-31T15:30:00-0700",
-                    status=0,
-                ),
-                TickTickTask(
-                    id="ddl-1",
-                    projectId="p1",
-                    title="周三前交报告",
-                    dueDate="2026-04-01T18:00:00-0700",
-                    status=0,
-                ),
-            ]
 
     session_factory = make_session_factory()
     with session_factory() as session:
+        user = add_user(session)
         session.add(
-            User(
-                telegram_user_id="99",
-                display_name="Jiaxin",
-                current_timezone="America/Los_Angeles",
-                ticktick_access_token="access-token",
+            TaskShadow(
+                user_id=user.id,
+                ticktick_task_id="shadow-window-1",
+                semantic_type="windowed",
+                normalized_title="整理实验记录",
+                raw_nl_time="这两周",
+                window_start=datetime.fromisoformat("2026-03-27T00:00:00-07:00"),
+                window_end=datetime.fromisoformat("2026-04-02T23:59:00-07:00"),
+            )
+        )
+        session.add(
+            TaskShadow(
+                user_id=user.id,
+                ticktick_task_id="shadow-memo-1",
+                semantic_type="memo",
+                normalized_title="回导师邮件",
+                raw_nl_time="下班后",
             )
         )
         session.commit()
 
     service = TodayBriefService(
         session_factory=session_factory,
-        ticktick_client=MixedFutureClient(),
+        ticktick_client=FakeTickTickClient([]),
     )
 
     message = await service.build_today_brief(
         telegram_user_id="99",
-        now=datetime.fromisoformat("2026-03-29T09:00:00-07:00"),
+        now=datetime.fromisoformat("2026-03-27T09:00:00-07:00"),
     )
 
-    assert "周三前交报告" in message
-    ddl_section = message.split("未来 7 天的 ddl：", 1)[1].split("这几天要推进的时间窗口任务：", 1)[0]
-    assert "周二下午评审会" not in ddl_section
-
-
-@pytest.mark.asyncio
-async def test_build_today_brief_uses_top_section_without_repeating_all_today_items() -> None:
-    from ticktick_telegram_assistant.services.today_brief_service import TodayBriefService
-
-    class TodayOnlyClient(FakeTickTickClient):
-        async def list_tasks(self, *, access_token: str, since=None) -> list[TickTickTask]:
-            self.calls.append({"method": "list_tasks", "access_token": access_token, "since": since})
-            return [
-                TickTickTask(
-                    id="t1",
-                    projectId="p1",
-                    title="上午先发邮件",
-                    dueDate="2026-03-29T17:00:00-0700",
-                    priority=5,
-                    status=0,
-                ),
-                TickTickTask(
-                    id="t2",
-                    projectId="p1",
-                    title="下午交周报",
-                    dueDate="2026-03-29T19:00:00-0700",
-                    status=0,
-                ),
-            ]
-
-    session_factory = make_session_factory()
-    with session_factory() as session:
-        session.add(
-            User(
-                telegram_user_id="99",
-                display_name="Jiaxin",
-                current_timezone="America/Los_Angeles",
-                ticktick_access_token="access-token",
-            )
-        )
-        session.commit()
-
-    service = TodayBriefService(
-        session_factory=session_factory,
-        ticktick_client=TodayOnlyClient(),
-    )
-
-    message = await service.build_today_brief(
-        telegram_user_id="99",
-        now=datetime.fromisoformat("2026-03-29T09:00:00-07:00"),
-    )
-
-    top_section = message.split("今天最重要的几件：", 1)[1].split("今天有明确时间的安排：", 1)[0]
-    scheduled_section = message.split("今天有明确时间的安排：", 1)[1].split("未来 7 天的 ddl：", 1)[0]
-    assert top_section.index("上午先发邮件") < top_section.index("下午交周报")
-    assert "重点都在上面了" in scheduled_section
-
-
-@pytest.mark.asyncio
-async def test_build_today_brief_uses_fixed_structure_when_everything_is_empty() -> None:
-    from ticktick_telegram_assistant.services.today_brief_service import TodayBriefService
-
-    class EmptyClient(FakeTickTickClient):
-        async def list_tasks(self, *, access_token: str, since=None) -> list[TickTickTask]:
-            self.calls.append({"method": "list_tasks", "access_token": access_token, "since": since})
-            return []
-
-    session_factory = make_session_factory()
-    with session_factory() as session:
-        session.add(
-            User(
-                telegram_user_id="99",
-                display_name="Jiaxin",
-                current_timezone="America/Los_Angeles",
-                ticktick_access_token="access-token",
-            )
-        )
-        session.commit()
-
-    service = TodayBriefService(
-        session_factory=session_factory,
-        ticktick_client=EmptyClient(),
-    )
-
-    message = await service.build_today_brief(
-        telegram_user_id="99",
-        now=datetime.fromisoformat("2026-03-29T09:00:00-07:00"),
-    )
-
-    assert "今天最重要的几件：" in message
-    assert "今天有明确时间的安排：" in message
-    assert "未来 7 天的 ddl：" in message
-    assert "这几天要推进的时间窗口任务：" in message
-
-
-@pytest.mark.asyncio
-async def test_build_today_brief_renders_calendar_date_for_future_deadlines() -> None:
-    from ticktick_telegram_assistant.services.today_brief_service import TodayBriefService
-
-    class FutureDeadlineClient(FakeTickTickClient):
-        async def list_tasks(self, *, access_token: str, since=None) -> list[TickTickTask]:
-            self.calls.append({"method": "list_tasks", "access_token": access_token, "since": since})
-            return [
-                TickTickTask(
-                    id="ddl-1",
-                    projectId="p1",
-                    title="周三前交报告",
-                    dueDate="2026-04-01T18:00:00-0700",
-                    status=0,
-                ),
-            ]
-
-    session_factory = make_session_factory()
-    with session_factory() as session:
-        session.add(
-            User(
-                telegram_user_id="99",
-                display_name="Jiaxin",
-                current_timezone="America/Los_Angeles",
-                ticktick_access_token="access-token",
-            )
-        )
-        session.commit()
-
-    service = TodayBriefService(
-        session_factory=session_factory,
-        ticktick_client=FutureDeadlineClient(),
-    )
-
-    message = await service.build_today_brief(
-        telegram_user_id="99",
-        now=datetime.fromisoformat("2026-03-29T09:00:00-07:00"),
-    )
-
-    assert "04/01 周三" in message
-
-
-@pytest.mark.asyncio
-async def test_build_today_brief_keeps_deadline_detail_even_if_it_is_also_top_item() -> None:
-    from ticktick_telegram_assistant.services.today_brief_service import TodayBriefService
-
-    class SingleDeadlineClient(FakeTickTickClient):
-        async def list_tasks(self, *, access_token: str, since=None) -> list[TickTickTask]:
-            self.calls.append({"method": "list_tasks", "access_token": access_token, "since": since})
-            return [
-                TickTickTask(
-                    id="ddl-1",
-                    projectId="p1",
-                    title="周三前交报告",
-                    dueDate="2026-04-01T18:00:00-0700",
-                    priority=5,
-                    status=0,
-                ),
-            ]
-
-    session_factory = make_session_factory()
-    with session_factory() as session:
-        session.add(
-            User(
-                telegram_user_id="99",
-                display_name="Jiaxin",
-                current_timezone="America/Los_Angeles",
-                ticktick_access_token="access-token",
-            )
-        )
-        session.commit()
-
-    service = TodayBriefService(
-        session_factory=session_factory,
-        ticktick_client=SingleDeadlineClient(),
-    )
-
-    message = await service.build_today_brief(
-        telegram_user_id="99",
-        now=datetime.fromisoformat("2026-03-29T09:00:00-07:00"),
-    )
-
-    top_section = message.split("今天最重要的几件：", 1)[1].split("今天有明确时间的安排：", 1)[0]
-    ddl_section = message.split("未来 7 天的 ddl：", 1)[1].split("这几天要推进的时间窗口任务：", 1)[0]
-    assert "周三前交报告" in top_section
-    assert "04/01 周三" in ddl_section
-    assert "周三前交报告" in ddl_section
+    assert "这段时间可以找空推进的事" in message
+    assert "顺手记着的小备忘（暂未安排具体时间，记下以便后续安排）" in message
+    assert "整理实验记录" in message
+    assert "这两周" in message
+    assert "回导师邮件" in message

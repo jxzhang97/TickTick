@@ -149,11 +149,12 @@ async def test_reminder_worker_uses_today_brief_structure_for_morning_brief() ->
 
     assert len(telegram_client.sent_messages) == 1
     message = telegram_client.sent_messages[0]["text"]
-    assert "今天最重要的几件：" in message
-    assert "今天有明确时间的安排：" in message
-    assert "未来 7 天的 ddl：" in message
-    assert "这几天要推进的时间窗口任务：" in message
-    assert "04/01 周三" in message
+    assert "2026-03-29 周日" in message
+    assert "今天有明确时间的任务" in message
+    assert "未完成的事情提醒（需要跟进的截止项）" in message
+    assert "接下来 7 天的明确安排和截止提醒" in message
+    assert "未来 7 天里适合找空完成的事" in message
+    assert "04-01 周三" in message
 
 
 @pytest.mark.asyncio
