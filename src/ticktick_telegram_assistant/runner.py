@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 
 from openai import AsyncOpenAI
@@ -19,6 +20,9 @@ from ticktick_telegram_assistant.services.ticktick_oauth_service import TickTick
 from ticktick_telegram_assistant.services.timezone_resolver import TimezoneResolver
 from ticktick_telegram_assistant.services.today_brief_service import TodayBriefService
 from ticktick_telegram_assistant.workers.reminder_worker import ReminderWorker
+
+
+logger = logging.getLogger(__name__)
 
 
 class LocalAssistantRunner:
@@ -47,9 +51,36 @@ class LocalAssistantRunner:
 
     async def run_forever(self, *, iterations: int | None = None, sleep_seconds: float = 1.0) -> None:
         await self.bootstrap()
+        poll_task = asyncio.create_task(self._run_polling_loop(iterations=iterations))
+        reminder_task = asyncio.create_task(
+            self._run_reminder_loop(iterations=iterations, sleep_seconds=sleep_seconds)
+        )
+        try:
+            await asyncio.gather(poll_task, reminder_task)
+        finally:
+            poll_task.cancel()
+            reminder_task.cancel()
+            await asyncio.gather(poll_task, reminder_task, return_exceptions=True)
+
+    async def _run_polling_loop(self, *, iterations: int | None) -> None:
         run_count = 0
         while iterations is None or run_count < iterations:
-            await self.run_once()
+            try:
+                self.last_update_offset = await self._poller.poll_once(self.last_update_offset)
+                self._save_offset_state(self.last_update_offset)
+            except Exception:
+                logger.exception("polling loop iteration failed")
+            run_count += 1
+            if iterations is None or run_count < iterations:
+                await asyncio.sleep(0)
+
+    async def _run_reminder_loop(self, *, iterations: int | None, sleep_seconds: float) -> None:
+        run_count = 0
+        while iterations is None or run_count < iterations:
+            try:
+                await self._reminder_worker.run_once()
+            except Exception:
+                logger.exception("reminder loop iteration failed")
             run_count += 1
             if iterations is None or run_count < iterations:
                 await asyncio.sleep(sleep_seconds)
