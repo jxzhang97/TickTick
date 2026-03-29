@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import re
 
+import httpx
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -97,6 +98,15 @@ class ConversationService:
         try:
             replies = await self._handle_update(update, trace=trace)
         except Exception as exc:
+            upstream_reply = self._build_ticktick_upstream_error_reply(update=update, exc=exc)
+            if upstream_reply is not None:
+                trace["status"] = "ticktick_upstream_error"
+                trace["execution_result_json"] = {
+                    "error": str(exc),
+                    "reply_texts": [upstream_reply.text],
+                }
+                self._write_action_log(update=update, trace=trace, replies=[upstream_reply])
+                return [upstream_reply]
             self._write_action_log(
                 update=update,
                 trace={
@@ -661,11 +671,18 @@ class ConversationService:
                     )
                 },
             )
-            line_replies = await self._handle_update(
-                line_update,
-                skip_pending_contexts=True,
-                skip_multiline_batch=True,
-            )
+            try:
+                line_replies = await self._handle_update(
+                    line_update,
+                    skip_pending_contexts=True,
+                    skip_multiline_batch=True,
+                )
+            except Exception as exc:
+                batch_error_reply = self._build_ticktick_batch_error_text(exc=exc)
+                if batch_error_reply is None:
+                    raise
+                reply_texts.append(batch_error_reply)
+                break
             reply_texts.extend(reply.text for reply in line_replies if reply.text)
             confirmation_context = self._load_pending_confirmation_context(telegram_user_id=telegram_user_id)
             if confirmation_context is not None:
@@ -699,6 +716,46 @@ class ConversationService:
 
         combined_text = "\n".join(reply_texts)
         return [TelegramReply(chat_id=update.message.chat.id, text=combined_text)]
+
+    def _build_ticktick_upstream_error_reply(
+        self,
+        *,
+        update: TelegramUpdate,
+        exc: Exception,
+    ) -> TelegramReply | None:
+        if update.message is None or not self._is_ticktick_upstream_error(exc):
+            return None
+        return TelegramReply(
+            chat_id=update.message.chat.id,
+            text=(
+                "TickTick 这边刚刚有点不稳定，我先没乱动。"
+                "你过一会儿再问我一次，或者把这条再发我一次，我就继续帮你。"
+            ),
+        )
+
+    def _build_ticktick_batch_error_text(self, *, exc: Exception) -> str | None:
+        if not self._is_ticktick_upstream_error(exc):
+            return None
+        return (
+            "TickTick 这边刚刚有点不稳定，前面已经处理到的我先保留，"
+            "后面的我先没乱动。你过一会儿把剩下的再发我一次，我继续接着帮你。"
+        )
+
+    def _is_ticktick_upstream_error(self, exc: Exception) -> bool:
+        seen: set[int] = set()
+        current: Exception | None = exc
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if isinstance(current, httpx.HTTPStatusError):
+                request_url = str(current.request.url) if current.request is not None else ""
+                if "ticktick.com" in request_url and 500 <= current.response.status_code < 600:
+                    return True
+            elif isinstance(current, httpx.RequestError):
+                request_url = str(current.request.url) if current.request is not None else ""
+                if "ticktick.com" in request_url:
+                    return True
+            current = current.__cause__ or current.__context__
+        return False
 
     def _resolve_follow_up_text(self, *, telegram_user_id: str | None, text: str) -> str:
         if telegram_user_id is None:

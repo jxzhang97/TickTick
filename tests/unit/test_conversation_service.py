@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 
+import httpx
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -72,6 +73,16 @@ class FakeTaskQueryService:
         return self.reply_text
 
 
+class FaultyTaskQueryService(FakeTaskQueryService):
+    def __init__(self, exc: Exception) -> None:
+        super().__init__(reply_text="")
+        self._exc = exc
+
+    async def build_query_reply(self, *, telegram_user_id: str, query, now=None) -> str:
+        self.calls.append({"telegram_user_id": telegram_user_id, "query": query, "now": now})
+        raise self._exc
+
+
 class FakeTimezoneResolver:
     def __init__(self, *, location_timezone: str | None = None, text_timezone: str | None = None) -> None:
         self.location_timezone = location_timezone
@@ -113,6 +124,25 @@ class FakeTaskCommandService:
             action.target_task_id = self.created_task_id
         self.calls.append({"telegram_user_id": telegram_user_id, "action": action, "now": now})
         return self.reply_text
+
+
+class SequencedTaskCommandService(FakeTaskCommandService):
+    def __init__(self, outcomes: list[object]) -> None:
+        super().__init__(reply_text="")
+        self._outcomes = list(outcomes)
+
+    async def execute_action(self, *, telegram_user_id: str, action, now=None) -> str:
+        self.calls.append({"telegram_user_id": telegram_user_id, "action": action, "now": now})
+        outcome = self._outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return str(outcome)
+
+
+def make_ticktick_500_error(path: str = "/open/v1/project") -> httpx.HTTPStatusError:
+    request = httpx.Request("GET", f"https://api.ticktick.com{path}")
+    response = httpx.Response(500, request=request)
+    return httpx.HTTPStatusError("temporary failure", request=request, response=response)
 
 
 def make_session_factory() -> sessionmaker[Session]:
@@ -252,6 +282,45 @@ async def test_handle_update_returns_today_brief_when_ticktick_connected() -> No
     assert oauth_service.calls == [{"method": "has_connection", "telegram_user_id": "99"}]
     assert len(query_service.calls) == 1
     assert query_service.calls[0]["query"].time_scope == "today"
+
+
+@pytest.mark.asyncio
+async def test_handle_update_returns_friendly_reply_when_query_hits_ticktick_500() -> None:
+    planner = FakePlanner(
+        PlannedConversation(
+            intent_type="query",
+            query={
+                "query_kind": "today_brief",
+                "query_text": "今天有什么安排",
+                "time_scope": "today",
+            },
+        )
+    )
+    oauth_service = FakeTickTickOAuthService(connected=True, auth_url=None)
+    query_service = FaultyTaskQueryService(make_ticktick_500_error())
+    service = ConversationService(
+        planner=planner,
+        ticktick_oauth_service=oauth_service,
+        task_query_service=query_service,
+    )
+    update = TelegramUpdate.model_validate(
+        {
+            "update_id": 4_0,
+            "message": {
+                "message_id": 10_0,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "今天有什么安排",
+            },
+        }
+    )
+
+    replies = await service.handle_update(update)
+
+    assert len(replies) == 1
+    assert "TickTick" in replies[0].text
+    assert "不稳定" in replies[0].text
+    assert "再问我一次" in replies[0].text
 
 
 @pytest.mark.asyncio
@@ -1271,6 +1340,43 @@ async def test_handle_update_processes_multiline_batch_sequentially() -> None:
         "task-created-1",
         "task-created-1",
     ]
+
+
+@pytest.mark.asyncio
+async def test_handle_update_multiline_batch_keeps_completed_replies_before_ticktick_500() -> None:
+    planner = FakePlanner(
+        [
+            PlannedConversation(actions=[{"action_type": "complete_task", "payload": {"title": "和家里打电话"}}]),
+            PlannedConversation(actions=[{"action_type": "update_task", "payload": {"match_title": "回复PRL Referee"}}]),
+        ]
+    )
+    oauth_service = FakeTickTickOAuthService(connected=True, auth_url=None)
+    task_command_service = SequencedTaskCommandService(
+        ["好，这条我帮你勾完成了：和家里打电话", make_ticktick_500_error()]
+    )
+    service = ConversationService(
+        planner=planner,
+        ticktick_oauth_service=oauth_service,
+        task_command_service=task_command_service,
+    )
+    update = TelegramUpdate.model_validate(
+        {
+            "update_id": 10_0,
+            "message": {
+                "message_id": 16_0,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "• 和家里打电话已完成\n• 回复PRL Referee 改到 4月3号",
+            },
+        }
+    )
+
+    replies = await service.handle_update(update)
+
+    assert len(replies) == 1
+    assert "好，这条我帮你勾完成了：和家里打电话" in replies[0].text
+    assert "TickTick" in replies[0].text
+    assert "后面的我先没乱动" in replies[0].text
 
 
 @pytest.mark.asyncio
