@@ -10,6 +10,7 @@ rsync -az \
   --exclude '.venv' \
   --exclude '.env' \
   --exclude 'assistant.db' \
+  --exclude 'state/' \
   --exclude 'logs/' \
   --exclude '.pytest_cache' \
   "${REPO_ROOT}/" "studio:${REMOTE_ROOT}/"

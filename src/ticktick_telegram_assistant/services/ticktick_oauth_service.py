@@ -33,7 +33,7 @@ class TickTickOAuthService:
     async def has_connection(self, *, telegram_user_id: str) -> bool:
         with self._session_factory() as session:
             user = UserRepository(session).get_by_telegram_user_id(telegram_user_id)
-            return bool(user and user.ticktick_access_token)
+            return self._has_durable_connection(user=user)
 
     async def create_authorization_url(
         self,
@@ -123,6 +123,19 @@ class TickTickOAuthService:
             if context.payload_json.get("state") == state:
                 return context
         return None
+
+    def _has_durable_connection(self, *, user: User | None) -> bool:
+        if user is None:
+            return False
+        if user.ticktick_refresh_token:
+            return True
+
+        expires_at = user.ticktick_token_expires_at
+        if expires_at is None:
+            return False
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        return expires_at > datetime.now(timezone.utc)
 
     def _store_token(self, *, user: User, token: TickTickTokenResponse) -> None:
         expires_at = None

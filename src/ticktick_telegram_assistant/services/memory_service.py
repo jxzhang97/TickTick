@@ -73,13 +73,18 @@ class MemoryService:
         now: datetime | None = None,
         candidate_tasks: list[str] | None = None,
         memory_limit: int = 5,
+        summary_limit: int = 3,
     ) -> ConversationContext:
-        memory_items = self.get_relevant_memory_items(user_id=user_id, query=text, limit=memory_limit)
+        summaries = self.list_conversation_summaries(user_id=user_id, limit=summary_limit)
+        summary_texts = [summary.summary_text.strip() for summary in summaries if summary.summary_text.strip()]
+        summary_items = [f"conversation_summary: {summary_text}" for summary_text in summary_texts]
+        memory_items = summary_items + self.get_relevant_memory_items(user_id=user_id, query=text, limit=memory_limit)
         return self._context_builder.build(
             text,
             current_timezone=current_timezone,
             now=now,
             memory_items=memory_items,
+            recent_conversation_summaries=summary_texts,
             candidate_tasks=candidate_tasks or [],
         )
 

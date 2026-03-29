@@ -67,6 +67,7 @@ class ReminderWorker:
 
         await self._send_prestart_reminders(user=user, local_now=local_now, tasks=tasks, timezone_name=timezone_name, now=now)
         await self._send_windowed_reminders(user=user, local_now=local_now, now=now)
+        await self._send_weekly_memo_cleanup(user=user, local_now=local_now, now=now)
 
         if self._is_trigger_time(local_now, hour=23, minute=30):
             text = self._build_evening_review(local_now=local_now, task_lines=task_lines)
@@ -99,14 +100,14 @@ class ReminderWorker:
         for task in tasks:
             if task.status == 2 or task.completed or task.isAllDay:
                 continue
-            due_at = self._parse_ticktick_datetime(task.dueDate, timezone_name=timezone_name)
-            if due_at is None:
+            anchor_at = self._task_anchor_datetime(task=task, timezone_name=timezone_name)
+            if anchor_at is None:
                 continue
-            scheduled_at = due_at - timedelta(minutes=5)
-            if not (scheduled_at <= local_now < due_at):
+            scheduled_at = anchor_at - timedelta(minutes=5)
+            if not (scheduled_at <= local_now < anchor_at):
                 continue
             description = task.desc or task.content or None
-            text = f"还有 5 分钟：{self._renderer.render_weekday(due_at)} {due_at.strftime('%H:%M')} {task.title}"
+            text = f"还有 5 分钟：{self._renderer.render_weekday(anchor_at)} {anchor_at.strftime('%H:%M')} {task.title}"
             if description:
                 text = f"{text}，{description}"
             await self._send_once(
@@ -121,7 +122,8 @@ class ReminderWorker:
                     "text": text,
                     "task_id": task.id,
                     "title": task.title,
-                    "task_due_at": task.dueDate,
+                    "task_due_at": scheduled_at.isoformat(),
+                    "task_deadline_at": task.dueDate,
                 },
             )
 
@@ -242,6 +244,52 @@ class ReminderWorker:
                     payload_json={"text": text, "task_id": shadow.ticktick_task_id, "title": title},
                 )
 
+    async def _send_weekly_memo_cleanup(self, *, user: User, local_now: datetime, now: datetime) -> None:
+        if local_now.weekday() != 6 or not self._is_trigger_time(local_now, hour=17, minute=0):
+            return
+
+        with self._session_factory() as session:
+            memos = TaskShadowRepository(session).list_memo_by_user(user_id=user.id)
+
+        memo_items = []
+        for shadow in memos[:8]:
+            title = shadow.normalized_title or "待整理备忘"
+            memo_items.append(
+                {
+                    "task_id": shadow.ticktick_task_id,
+                    "title": title,
+                    "description": shadow.raw_nl_time,
+                }
+            )
+
+        if not memo_items:
+            return
+
+        lines = ["周末收尾一下：这周攒下的备忘先过一遍。"]
+        for item in memo_items:
+            if item["description"]:
+                lines.append(f"- {item['title']}（{item['description']}）")
+            else:
+                lines.append(f"- {item['title']}")
+        if len(memos) > len(memo_items):
+            lines.append(f"还有 {len(memos) - len(memo_items)} 条我先没展开。")
+        lines.append("你可以直接回我“把第1条变成任务”或者“先都留着”。")
+        text = "\n".join(lines)
+        week = local_now.isocalendar()
+        dedupe_key = f"memo_cleanup:{user.id}:{week.year}-W{week.week:02d}"
+        await self._send_once(
+            user=user,
+            dedupe_key=dedupe_key,
+            event_type="memo_cleanup",
+            scheduled_at=local_now.replace(hour=17, minute=0, second=0, microsecond=0),
+            text=text,
+            now=now,
+            payload_json={
+                "text": text,
+                "candidate_tasks": memo_items,
+            },
+        )
+
     def _build_windowed_items(
         self,
         *,
@@ -284,21 +332,33 @@ class ReminderWorker:
         for task in tasks:
             if task.status == 2 or task.completed:
                 continue
-            effective_dt = self._parse_ticktick_datetime(task.dueDate or task.startDate, timezone_name=timezone_name)
+            start_dt = self._parse_ticktick_datetime(task.startDate, timezone_name=timezone_name)
+            due_dt = self._parse_ticktick_datetime(task.dueDate, timezone_name=timezone_name)
+            effective_dt = start_dt or due_dt
             if effective_dt is None:
                 continue
+            if task.isAllDay:
+                when = "今天"
+            elif start_dt is not None and due_dt is not None and due_dt > start_dt:
+                when = f"{start_dt.strftime('%H:%M')}-{due_dt.strftime('%H:%M')}"
+            else:
+                when = effective_dt.strftime("%H:%M")
             lines.append(
                 {
                     "task_id": task.id,
                     "date": effective_dt.date().isoformat(),
                     "sort_key": effective_dt,
                     "weekday": self._renderer.render_weekday(effective_dt),
-                    "when": "今天" if task.isAllDay else effective_dt.strftime("%H:%M"),
+                    "when": when,
                     "title": task.title,
                     "description": task.desc or task.content or None,
                 }
             )
         return lines
+
+    def _task_anchor_datetime(self, *, task: TickTickTask, timezone_name: str) -> datetime | None:
+        anchor_raw = task.startDate or task.dueDate
+        return self._parse_ticktick_datetime(anchor_raw, timezone_name=timezone_name)
 
     def _parse_ticktick_datetime(self, raw: str | None, *, timezone_name: str) -> datetime | None:
         if not raw:

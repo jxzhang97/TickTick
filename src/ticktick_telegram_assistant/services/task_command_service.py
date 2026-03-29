@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import re
 from typing import Any, Optional, Union
 
 from sqlalchemy.orm import Session, sessionmaker
@@ -67,10 +68,20 @@ class TaskCommandService:
         semantic_type = str(action.payload.get("semantic_type") or "memo")
         due_at = self._coerce_datetime(action.payload.get("due_at"))
         start_at = self._coerce_datetime(action.payload.get("start_at"))
+        end_at = self._coerce_datetime(action.payload.get("end_at"))
+        duration_minutes = self._coerce_duration_minutes(action.payload.get("duration_minutes"))
+        start_at, due_at, end_at = self._resolve_time_span(
+            start_at=start_at,
+            due_at=due_at,
+            end_at=end_at,
+            duration_minutes=duration_minutes,
+        )
         window_start = self._coerce_datetime(action.payload.get("window_start"))
         window_end = self._coerce_datetime(action.payload.get("window_end"))
         raw_nl_time = self._clean_optional_text(action.payload.get("raw_nl_time"))
-        repeat_rule = self._clean_optional_text(action.payload.get("repeat_rule") or action.payload.get("repeatFlag"))
+        repeat_rule = self._normalize_repeat_rule(
+            action.payload.get("repeat_rule") or action.payload.get("repeatFlag")
+        )
         priority = self._coerce_priority(action.payload.get("priority"))
         tags = self._normalize_tags(action.payload.get("tags"))
         checklist_items = self._extract_checklist_items(action.payload)
@@ -106,6 +117,7 @@ class TaskCommandService:
                     tags_json=tags or None,
                     due_at=due_at,
                     start_at=start_at,
+                    end_at=end_at,
                     window_start=window_start,
                     window_end=window_end,
                     raw_nl_time=raw_nl_time,
@@ -118,6 +130,7 @@ class TaskCommandService:
         return self._render_create_reply(
             title=title,
             semantic_type=semantic_type,
+            start_at=start_at,
             due_at=due_at,
             raw_nl_time=raw_nl_time,
             notes=self._build_advanced_field_notes(
@@ -169,11 +182,18 @@ class TaskCommandService:
         *,
         title: str,
         semantic_type: str,
+        start_at: Optional[datetime],
         due_at: Optional[datetime],
         raw_nl_time: Optional[str],
         notes: Optional[list[str]] = None,
     ) -> str:
-        if semantic_type == "explicit_time" and due_at is not None:
+        if semantic_type == "explicit_time" and start_at is not None and due_at is not None and due_at > start_at:
+            base_reply = (
+                "好，我已经替你记进 TickTick 了："
+                f"{self._message_renderer.render_weekday(start_at)} "
+                f"{start_at.strftime('%H:%M')}-{due_at.strftime('%H:%M')} {title}"
+            )
+        elif semantic_type == "explicit_time" and due_at is not None:
             base_reply = (
                 "好，我已经替你记进 TickTick 了："
                 f"{self._message_renderer.render_weekday(due_at)} {due_at.strftime('%H:%M')} {title}"
@@ -248,8 +268,26 @@ class TaskCommandService:
         description_mode = self._clean_optional_text(action.payload.get("description_mode")) or "replace"
         due_at = self._coerce_datetime(action.payload.get("due_at"))
         start_at = self._coerce_datetime(action.payload.get("start_at"))
+        end_at = self._coerce_datetime(action.payload.get("end_at"))
+        duration_minutes = self._coerce_duration_minutes(action.payload.get("duration_minutes"))
+        start_at, due_at, end_at = self._resolve_time_span(
+            start_at=start_at,
+            due_at=due_at,
+            end_at=end_at,
+            duration_minutes=duration_minutes,
+        )
+        semantic_type = self._resolve_semantic_type(
+            explicit_value=self._clean_optional_text(action.payload.get("semantic_type")),
+            start_at=start_at,
+            due_at=due_at,
+            window_start=None,
+            window_end=None,
+            fallback=None,
+        )
         raw_nl_time = self._clean_optional_text(action.payload.get("raw_nl_time"))
-        repeat_rule = self._clean_optional_text(action.payload.get("repeat_rule") or action.payload.get("repeatFlag"))
+        repeat_rule = self._normalize_repeat_rule(
+            action.payload.get("repeat_rule") or action.payload.get("repeatFlag")
+        )
         priority = self._coerce_priority(action.payload.get("priority"))
         tags = self._normalize_tags(action.payload.get("tags"))
         checklist_items = self._extract_checklist_items(action.payload)
@@ -306,14 +344,22 @@ class TaskCommandService:
                 shadow = TaskShadow(
                     user_id=user_id,
                     ticktick_task_id=target_task.id,
-                    semantic_type="explicit_time" if due_at else "memo",
+                    semantic_type=semantic_type or ("explicit_time" if due_at else "memo"),
                 )
                 TaskShadowRepository(session).add(shadow)
+            if semantic_type is not None:
+                shadow.semantic_type = semantic_type
+            elif due_at is not None or start_at is not None:
+                shadow.semantic_type = "explicit_time"
             shadow.normalized_title = new_title or target_task.title
             shadow.list_name = target_list_name or shadow.list_name
             shadow.tags_json = tags or shadow.tags_json
             shadow.due_at = due_at or shadow.due_at
             shadow.start_at = start_at or shadow.start_at
+            shadow.end_at = end_at or shadow.end_at
+            if shadow.semantic_type == "explicit_time":
+                shadow.window_start = None
+                shadow.window_end = None
             shadow.raw_nl_time = raw_nl_time or shadow.raw_nl_time
             shadow.timezone_mode = "fixed" if (due_at or start_at) else shadow.timezone_mode
             shadow.last_synced_at = datetime.now(timezone.utc)
@@ -321,6 +367,7 @@ class TaskCommandService:
 
         return self._render_update_reply(
             title=new_title or target_task.title,
+            start_at=start_at,
             due_at=due_at,
             description_changed=updated_description is not None,
             moved_list_name=target_list_name,
@@ -387,6 +434,16 @@ class TaskCommandService:
         except (TypeError, ValueError):
             return None
 
+    def _coerce_duration_minutes(self, value: Optional[object]) -> Optional[int]:
+        cleaned = self._clean_optional_text(value)
+        if cleaned is None:
+            return None
+        try:
+            minutes = int(cleaned)
+        except (TypeError, ValueError):
+            return None
+        return minutes if minutes > 0 else None
+
     def _format_ticktick_datetime(self, value: datetime) -> str:
         return value.strftime("%Y-%m-%dT%H:%M:%S%z")
 
@@ -416,6 +473,72 @@ class TaskCommandService:
             if text and text not in tags:
                 tags.append(text)
         return tags
+
+    def _normalize_repeat_rule(self, value: Optional[object]) -> Optional[str]:
+        cleaned = self._clean_optional_text(value)
+        if cleaned is None:
+            return None
+        normalized = cleaned.casefold().replace(" ", "")
+        if "freq=" in normalized:
+            return cleaned
+        weekday_match = re.search(r"每周([一二三四五六日天])", normalized)
+        if weekday_match:
+            weekday = {
+                "一": "MO",
+                "二": "TU",
+                "三": "WE",
+                "四": "TH",
+                "五": "FR",
+                "六": "SA",
+                "日": "SU",
+                "天": "SU",
+            }[weekday_match.group(1)]
+            return f"FREQ=WEEKLY;BYDAY={weekday}"
+        mapping = {
+            "每天": "FREQ=DAILY",
+            "每日": "FREQ=DAILY",
+            "每周": "FREQ=WEEKLY",
+            "每周自动循环": "FREQ=WEEKLY",
+            "每月": "FREQ=MONTHLY",
+            "每月自动循环": "FREQ=MONTHLY",
+            "工作日": "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR",
+            "每个工作日": "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR",
+        }
+        return mapping.get(normalized, cleaned)
+
+    def _resolve_time_span(
+        self,
+        *,
+        start_at: Optional[datetime],
+        due_at: Optional[datetime],
+        end_at: Optional[datetime],
+        duration_minutes: Optional[int],
+    ) -> tuple[Optional[datetime], Optional[datetime], Optional[datetime]]:
+        resolved_end_at = end_at
+        if resolved_end_at is None and start_at is not None and duration_minutes is not None:
+            resolved_end_at = start_at + timedelta(minutes=duration_minutes)
+        resolved_due_at = due_at
+        if resolved_due_at is None and resolved_end_at is not None:
+            resolved_due_at = resolved_end_at
+        return start_at, resolved_due_at, resolved_end_at
+
+    def _resolve_semantic_type(
+        self,
+        *,
+        explicit_value: Optional[str],
+        start_at: Optional[datetime],
+        due_at: Optional[datetime],
+        window_start: Optional[datetime],
+        window_end: Optional[datetime],
+        fallback: Optional[str],
+    ) -> Optional[str]:
+        if explicit_value:
+            return explicit_value
+        if start_at is not None or due_at is not None:
+            return "explicit_time"
+        if window_start is not None or window_end is not None:
+            return "windowed"
+        return fallback
 
     def _extract_checklist_items(self, payload: dict[str, Any]) -> list[TickTickChecklistItem]:
         raw_items = payload.get("subtasks")
@@ -490,13 +613,18 @@ class TaskCommandService:
         self,
         *,
         title: str,
+        start_at: Optional[datetime],
         due_at: Optional[datetime],
         description_changed: bool,
         moved_list_name: Optional[str],
         notes: Optional[list[str]] = None,
     ) -> str:
         parts: list[str] = []
-        if due_at is not None:
+        if start_at is not None and due_at is not None and due_at > start_at:
+            parts.append(
+                f"{self._message_renderer.render_weekday(start_at)} {start_at.strftime('%H:%M')}-{due_at.strftime('%H:%M')}"
+            )
+        elif due_at is not None:
             parts.append(f"{self._message_renderer.render_weekday(due_at)} {due_at.strftime('%H:%M')}")
         parts.append(title)
         detail_bits: list[str] = []

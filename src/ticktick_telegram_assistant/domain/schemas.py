@@ -22,6 +22,7 @@ class ConversationContext(BaseModel):
     current_timezone: str = "America/Los_Angeles"
     current_local_time: Optional[str] = None
     memory_items: list[str] = Field(default_factory=list)
+    recent_conversation_summaries: list[str] = Field(default_factory=list)
     candidate_tasks: list[str] = Field(default_factory=list)
 
     def to_prompt(self) -> str:

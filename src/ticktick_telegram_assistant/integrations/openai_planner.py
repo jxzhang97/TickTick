@@ -49,6 +49,8 @@ class OpenAIPlanner:
                     "semantic_type": "explicit_time|windowed|memo",
                     "due_at": "有明确时间时填 ISO 8601",
                     "start_at": "可选 ISO 8601",
+                    "end_at": "有明确结束时间时填 ISO 8601",
+                    "duration_minutes": 90,
                     "window_start": "粗略时间窗口开始 ISO 8601",
                     "window_end": "粗略时间窗口结束 ISO 8601",
                     "raw_nl_time": "原始自然语言时间片段",
@@ -74,6 +76,8 @@ class OpenAIPlanner:
 
             时间规则：
             - 明确日期+时刻 => semantic_type=explicit_time，并填写 due_at。
+            - 如果用户给了开始和结束时间，填写 start_at/end_at。
+            - 如果用户给了开始时间和时长，填写 start_at/duration_minutes。
             - 粗略窗口，如“下周”“这两周”“月底前” => semantic_type=windowed，并填写 window_start/window_end/raw_nl_time。
             - 没有明确时间 => semantic_type=memo。
             - 保留用户原本的英文专有名词。

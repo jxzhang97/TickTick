@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -33,6 +34,60 @@ def make_session_factory() -> sessionmaker[Session]:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     return sessionmaker(bind=engine, class_=Session, expire_on_commit=False)
+
+
+@pytest.mark.asyncio
+async def test_has_connection_requires_durable_oauth_metadata() -> None:
+    from ticktick_telegram_assistant.services.ticktick_oauth_service import TickTickOAuthService
+
+    settings = Settings()
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        session.add(User(telegram_user_id="99", ticktick_access_token="access-only"))
+        session.commit()
+
+    service = TickTickOAuthService(
+        settings=settings,
+        session_factory=session_factory,
+        oauth_client=FakeOAuthClient(),
+    )
+
+    assert await service.has_connection(telegram_user_id="99") is False
+
+
+@pytest.mark.asyncio
+async def test_has_connection_accepts_refresh_token_or_unexpired_token() -> None:
+    from ticktick_telegram_assistant.services.ticktick_oauth_service import TickTickOAuthService
+
+    settings = Settings()
+    session_factory = make_session_factory()
+    now = datetime.now(timezone.utc)
+    with session_factory() as session:
+        session.add(
+            User(
+                telegram_user_id="99",
+                ticktick_access_token="access-token",
+                ticktick_refresh_token="refresh-token",
+                ticktick_token_expires_at=now - timedelta(hours=1),
+            )
+        )
+        session.add(
+            User(
+                telegram_user_id="100",
+                ticktick_access_token="access-token",
+                ticktick_token_expires_at=now + timedelta(hours=1),
+            )
+        )
+        session.commit()
+
+    service = TickTickOAuthService(
+        settings=settings,
+        session_factory=session_factory,
+        oauth_client=FakeOAuthClient(),
+    )
+
+    assert await service.has_connection(telegram_user_id="99") is True
+    assert await service.has_connection(telegram_user_id="100") is True
 
 
 @pytest.mark.asyncio

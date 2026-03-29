@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import re
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -9,7 +9,12 @@ from sqlalchemy.orm import Session, sessionmaker
 from ticktick_telegram_assistant.db.models.reminder_event import ReminderEvent
 from ticktick_telegram_assistant.db.models.user import User
 from ticktick_telegram_assistant.domain.enums import MemoryType
-from ticktick_telegram_assistant.domain.schemas import PlannedAction, PlannedConversation, TelegramReply
+from ticktick_telegram_assistant.domain.schemas import (
+    ConversationContext,
+    PlannedAction,
+    PlannedConversation,
+    TelegramReply,
+)
 from ticktick_telegram_assistant.integrations.openai_planner import OpenAIPlanner
 from ticktick_telegram_assistant.repositories.reminders import ReminderRepository
 from ticktick_telegram_assistant.repositories.users import UserRepository
@@ -80,6 +85,15 @@ class ConversationService:
         self._active_task_contexts: dict[str, dict[str, str]] = {}
 
     async def handle_update(self, update: TelegramUpdate) -> list[TelegramReply]:
+        return await self._handle_update(update)
+
+    async def _handle_update(
+        self,
+        update: TelegramUpdate,
+        *,
+        skip_pending_contexts: bool = False,
+        skip_multiline_batch: bool = False,
+    ) -> list[TelegramReply]:
         if update.message is None:
             return []
         location_reply = await self._maybe_handle_location_update(update)
@@ -97,15 +111,17 @@ class ConversationService:
         snooze_reply = await self._maybe_handle_snooze_request(update)
         if snooze_reply is not None:
             return [snooze_reply]
-        confirmation_reply = await self._maybe_handle_pending_confirmation(update)
-        if confirmation_reply is not None:
-            return [confirmation_reply]
-        query_reply = await self._maybe_handle_pending_query(update)
-        if query_reply is not None:
-            return [query_reply]
-        batch_replies = await self._maybe_handle_multiline_batch(update)
-        if batch_replies is not None:
-            return batch_replies
+        if not skip_pending_contexts:
+            confirmation_reply = await self._maybe_handle_pending_confirmation(update)
+            if confirmation_reply is not None:
+                return [confirmation_reply]
+            query_reply = await self._maybe_handle_pending_query(update)
+            if query_reply is not None:
+                return [query_reply]
+        if not skip_multiline_batch:
+            batch_replies = await self._maybe_handle_multiline_batch(update)
+            if batch_replies is not None:
+                return batch_replies
         if self._is_evening_review_reply(update.message.text):
             return await self._handle_evening_review_reply(
                 telegram_user_id=self._telegram_user_id(update),
@@ -113,6 +129,9 @@ class ConversationService:
                 text=update.message.text,
                 current_timezone=self._current_timezone_for_update(update),
             )
+        memo_cleanup_reply = await self._maybe_handle_memo_cleanup_reply(update)
+        if memo_cleanup_reply is not None:
+            return [memo_cleanup_reply]
         ticktick_reply = await self._maybe_build_ticktick_reply(update)
         if ticktick_reply is not None:
             return [ticktick_reply]
@@ -132,6 +151,7 @@ class ConversationService:
             update=update,
             planned=planned,
             telegram_user_id=telegram_user_id,
+            context=context,
         )
         if action_reply is not None:
             return [action_reply]
@@ -313,7 +333,9 @@ class ConversationService:
             "做完",
         )
         lowered = text.lower()
-        return any(keyword in text or keyword in lowered for keyword in keywords)
+        if any(keyword in text or keyword in lowered for keyword in keywords):
+            return True
+        return bool(re.search(r"(今天|明天|后天|今晚|下周|这两周|月底前|周[一二三四五六日天]|上午|中午|下午|晚上|\d{1,2}点)", text))
 
     def _telegram_user_id(self, update: TelegramUpdate) -> str | None:
         if update.message is None:
@@ -355,16 +377,33 @@ class ConversationService:
         update: TelegramUpdate,
         planned: PlannedConversation,
         telegram_user_id: str | None,
+        context: ConversationContext,
+        allow_non_ticktick_request: bool = False,
     ) -> TelegramReply | None:
+        if planned.requires_confirmation:
+            if update.message is None or telegram_user_id is None:
+                return None
+            return self._save_planner_confirmation(
+                update=update,
+                telegram_user_id=telegram_user_id,
+                planned=planned,
+                context=context,
+            )
         if (
             self._task_command_service is None
             or update.message is None
             or update.message.text is None
-            or not planned.actions
-            or not self._looks_like_ticktick_request(update.message.text)
         ):
             return None
         if telegram_user_id is None:
+            return None
+        if not planned.actions:
+            return None
+        if (
+            not allow_non_ticktick_request
+            and not self._looks_like_ticktick_request(update.message.text)
+            and not any(action.action_type in {"create_task", "update_task", "complete_task"} for action in planned.actions)
+        ):
             return None
 
         action = planned.actions[0]
@@ -381,6 +420,29 @@ class ConversationService:
         )
         self._store_active_task_context(telegram_user_id=telegram_user_id, action=action)
         return TelegramReply(chat_id=update.message.chat.id, text=reply_text)
+
+    def _save_planner_confirmation(
+        self,
+        *,
+        update: TelegramUpdate,
+        telegram_user_id: str,
+        planned: PlannedConversation,
+        context: ConversationContext,
+    ) -> TelegramReply:
+        if update.message is None:
+            return TelegramReply(chat_id=0, text=planned.assistant_reply or "我需要你再确认一下。")
+        self._save_pending_confirmation(
+            telegram_user_id=telegram_user_id,
+            payload={
+                "kind": "planner_confirmation",
+                "assistant_reply": planned.assistant_reply,
+                "planned_context": context.model_dump(),
+            },
+        )
+        return TelegramReply(
+            chat_id=update.message.chat.id,
+            text=planned.assistant_reply or "我需要你再确认一下。",
+        )
 
     async def _maybe_handle_multiline_batch(self, update: TelegramUpdate) -> list[TelegramReply] | None:
         if update.message is None or update.message.text is None:
@@ -416,7 +478,11 @@ class ConversationService:
                     )
                 },
             )
-            line_replies = await self.handle_update(line_update)
+            line_replies = await self._handle_update(
+                line_update,
+                skip_pending_contexts=True,
+                skip_multiline_batch=True,
+            )
             reply_texts.extend(reply.text for reply in line_replies if reply.text)
 
         combined_text = "\n".join(reply_texts)
@@ -664,6 +730,30 @@ class ConversationService:
                 if item.get("task_id") and item.get("title")
             ]
 
+    def _load_latest_memo_cleanup_candidates(self, *, telegram_user_id: str) -> list[dict[str, str]]:
+        if self._session_factory is None:
+            return []
+        with self._session_factory() as session:
+            user = UserRepository(session).get_by_telegram_user_id(telegram_user_id)
+            if user is None:
+                return []
+            event = ReminderRepository(session).get_latest_for_user(
+                user_id=user.id,
+                event_types=["memo_cleanup"],
+                statuses=["sent"],
+            )
+            if event is None or not event.payload_json:
+                return []
+            raw_candidates = event.payload_json.get("candidate_tasks") or []
+            return [
+                {
+                    "task_id": str(item.get("task_id", "")),
+                    "title": str(item.get("title", "")),
+                }
+                for item in raw_candidates
+                if item.get("task_id") and item.get("title")
+            ]
+
     def _extract_reschedule_phrase(self, *, reply_text: str, index: int) -> str | None:
         ordinal_tokens = {
             0: ("第一个", "第1个", "第1条", "第一条", "第一个任务"),
@@ -723,6 +813,27 @@ class ConversationService:
             self._clear_pending_confirmation(telegram_user_id=telegram_user_id)
             return TelegramReply(chat_id=update.message.chat.id, text=reply_text)
 
+        if context.get("kind") == "awaiting_memo_schedule":
+            reply_text = await self._execute_memo_schedule_candidate(
+                telegram_user_id=telegram_user_id,
+                user_text=text,
+                candidate=context.get("candidate_task") or {},
+            )
+            self._clear_pending_confirmation(telegram_user_id=telegram_user_id)
+            return TelegramReply(chat_id=update.message.chat.id, text=reply_text)
+
+        if context.get("kind") == "planner_confirmation" and any(
+            token in text for token in ("继续", "就它", "确认", "是", "好", "可以", "行")
+        ):
+            reply_text = await self._execute_planner_confirmation(
+                telegram_user_id=telegram_user_id,
+                user_text=text,
+                context=context,
+                chat_id=update.message.chat.id,
+            )
+            self._clear_pending_confirmation(telegram_user_id=telegram_user_id)
+            return TelegramReply(chat_id=update.message.chat.id, text=reply_text)
+
         if "改时间" in text:
             self._save_pending_confirmation(
                 telegram_user_id=telegram_user_id,
@@ -757,6 +868,44 @@ class ConversationService:
             text="我先停在这一步。你可以回我“合并”“继续新建”“改时间”或者“取消”。",
         )
 
+    async def _execute_planner_confirmation(
+        self,
+        *,
+        telegram_user_id: str,
+        user_text: str,
+        context: dict,
+        chat_id: int,
+    ) -> str:
+        planned_context = context.get("planned_context") or {}
+        if not planned_context:
+            return "我知道你想继续，但这条待确认上下文已经丢了。"
+        stored_context = ConversationContext.model_validate(planned_context)
+        resumed_context = self._context_builder.build(
+            f"{stored_context.user_text}\n用户确认：{user_text}",
+            current_timezone=stored_context.current_timezone,
+            memory_items=stored_context.memory_items,
+            recent_conversation_summaries=stored_context.recent_conversation_summaries,
+            candidate_tasks=stored_context.candidate_tasks,
+        )
+        planned = await self._planner.plan(resumed_context)
+        response = await self._maybe_execute_planned_actions(
+            update=TelegramUpdate(
+                update_id=0,
+                message=TelegramMessage(
+                    message_id=0,
+                    chat=TelegramChat(id=chat_id, type="private"),
+                    text=user_text,
+                ),
+            ),
+            planned=planned,
+            telegram_user_id=telegram_user_id,
+            context=resumed_context,
+            allow_non_ticktick_request=True,
+        )
+        if response is None:
+            return planned.assistant_reply or "我已经记下你的确认，但这条还是没法稳定执行。"
+        return response.text
+
     async def _maybe_handle_pending_query(self, update: TelegramUpdate) -> TelegramReply | None:
         if update.message is None or update.message.text is None:
             return None
@@ -784,6 +933,47 @@ class ConversationService:
 
         return None
 
+    async def _maybe_handle_memo_cleanup_reply(self, update: TelegramUpdate) -> TelegramReply | None:
+        if update.message is None or update.message.text is None or self._task_command_service is None:
+            return None
+        telegram_user_id = self._telegram_user_id(update)
+        if telegram_user_id is None:
+            return None
+        candidates = self._load_latest_memo_cleanup_candidates(telegram_user_id=telegram_user_id)
+        if not candidates:
+            return None
+        text = update.message.text.strip()
+        if any(token in text for token in ("先都留着", "都留着", "先留着", "都先留着")):
+            return TelegramReply(
+                chat_id=update.message.chat.id,
+                text="好，那我先继续把这些留在备忘池里，等你想安排时间时再叫我。",
+            )
+        candidate_index = self._extract_candidate_index(text=text, candidate_count=len(candidates))
+        if candidate_index is None:
+            return None
+        candidate = candidates[candidate_index]
+        time_phrase = self._extract_schedule_phrase(text=text)
+        if time_phrase:
+            reply_text = await self._execute_memo_schedule_candidate(
+                telegram_user_id=telegram_user_id,
+                user_text=time_phrase,
+                candidate=candidate,
+            )
+            return TelegramReply(chat_id=update.message.chat.id, text=reply_text)
+        if any(token in text for token in ("变成任务", "安排时间", "安排一下", "正式安排")):
+            self._save_pending_confirmation(
+                telegram_user_id=telegram_user_id,
+                payload={
+                    "kind": "awaiting_memo_schedule",
+                    "candidate_task": candidate,
+                },
+            )
+            return TelegramReply(
+                chat_id=update.message.chat.id,
+                text=f"好，我把“{candidate['title']}”从备忘里拎出来了。你想把它安排到什么时候？",
+            )
+        return None
+
     async def _maybe_request_write_confirmation(self, *, telegram_user_id: str, action: PlannedAction) -> str | None:
         if self._session_factory is None or self._ticktick_client is None:
             return None
@@ -795,7 +985,16 @@ class ConversationService:
 
         tasks = await self._ticktick_client.list_tasks(access_token=user.ticktick_access_token, since=None)
         title = self._action_title(action)
+        start_at = self._coerce_datetime(action.payload.get("start_at"))
         due_at = self._coerce_datetime(action.payload.get("due_at"))
+        end_at = self._coerce_datetime(action.payload.get("end_at"))
+        duration_minutes = self._coerce_duration_minutes(action.payload.get("duration_minutes"))
+        start_at, due_at, end_at = self._resolve_time_span(
+            start_at=start_at,
+            due_at=due_at,
+            end_at=end_at,
+            duration_minutes=duration_minutes,
+        )
 
         duplicate_task = self._find_duplicate_task(tasks=tasks, title=title, exclude_task_id=action.target_task_id)
         if duplicate_task is not None and action.action_type == "create_task":
@@ -812,10 +1011,12 @@ class ConversationService:
                 "你想继续新建、合并到原来那条，还是改时间？"
             )
 
-        if due_at is not None:
+        if start_at is not None or due_at is not None:
             conflict_task = self._find_conflicting_task(
                 tasks=tasks,
+                start_at=start_at,
                 due_at=due_at,
+                end_at=end_at,
                 current_timezone=user.current_timezone or "America/Los_Angeles",
                 exclude_task_id=action.target_task_id,
             )
@@ -888,6 +1089,39 @@ class ConversationService:
         if original_action.action_type != "create_task":
             action.target_task_id = candidate.get("task_id")
             action.payload.setdefault("match_title", candidate.get("title") or title)
+        return await self._task_command_service.execute_action(
+            telegram_user_id=telegram_user_id,
+            action=action,
+        )
+
+    async def _execute_memo_schedule_candidate(
+        self,
+        *,
+        telegram_user_id: str,
+        user_text: str,
+        candidate: dict,
+    ) -> str:
+        title = str(candidate.get("title") or "").strip()
+        task_id = str(candidate.get("task_id") or "").strip()
+        if not title or not task_id:
+            return "我知道你想安排这条备忘，但这次没稳稳定位到具体对象。"
+        current_timezone = "America/Los_Angeles"
+        user = self._get_user_by_telegram_user_id(telegram_user_id)
+        if user is not None:
+            current_timezone = user.current_timezone or current_timezone
+        planned = await self._planner.plan(
+            self._context_builder.build(
+                f"任务“{title}”安排到{user_text}",
+                current_timezone=current_timezone,
+            )
+        )
+        if not planned.actions:
+            return f"我知道你想安排“{title}”，但新时间这次我还没抓稳。"
+        action = planned.actions[0]
+        action.action_type = "update_task"
+        action.target_task_id = task_id
+        action.payload.setdefault("match_title", title)
+        action.payload.setdefault("semantic_type", "explicit_time")
         return await self._task_command_service.execute_action(
             telegram_user_id=telegram_user_id,
             action=action,
@@ -1012,22 +1246,89 @@ class ConversationService:
         self,
         *,
         tasks: list,
-        due_at: datetime,
+        start_at: datetime | None,
+        due_at: datetime | None,
+        end_at: datetime | None,
         current_timezone: str,
         exclude_task_id: str | None,
     ) -> object | None:
-        due_iso = due_at.isoformat()
+        proposed_start = start_at or due_at
+        proposed_end = end_at or due_at
+        if proposed_start is None:
+            return None
         for task in tasks:
             if task.completed or task.status == 2:
                 continue
             if exclude_task_id and task.id == exclude_task_id:
                 continue
-            task_due_at = self._parse_ticktick_datetime(task.dueDate or task.startDate, timezone_name=current_timezone)
-            if task_due_at is None:
+            task_start_at = self._parse_ticktick_datetime(task.startDate or task.dueDate, timezone_name=current_timezone)
+            task_end_at = self._parse_ticktick_datetime(task.dueDate or task.startDate, timezone_name=current_timezone)
+            if task_start_at is None:
                 continue
-            if self._conflict_detector.has_conflict(due_iso, task_due_at.isoformat()):
+            if self._conflict_detector.has_conflict(
+                proposed_start.isoformat(),
+                task_start_at.isoformat(),
+                end_iso=proposed_end.isoformat() if proposed_end is not None else None,
+                other_end_iso=task_end_at.isoformat() if task_end_at is not None else None,
+            ):
                 return task
         return None
+
+    def _extract_candidate_index(self, *, text: str, candidate_count: int) -> int | None:
+        if candidate_count <= 0:
+            return None
+        if "最后" in text:
+            return candidate_count - 1
+        match = re.search(r"第\s*(\d+)\s*[条项个件]?", text)
+        if match:
+            index = int(match.group(1)) - 1
+            return index if 0 <= index < candidate_count else None
+        chinese_ordinals = {
+            "第一": 0,
+            "第二": 1,
+            "第三": 2,
+            "第四": 3,
+            "第五": 4,
+        }
+        for token, index in chinese_ordinals.items():
+            if token in text and index < candidate_count:
+                return index
+        return 0 if candidate_count == 1 else None
+
+    def _extract_schedule_phrase(self, *, text: str) -> str | None:
+        match = re.search(r"(?:安排到|安排成|改到|改成)(.+?)(?:$|，|,|。)", text)
+        if match:
+            return match.group(1).strip()
+        return None
+
+    def _coerce_duration_minutes(self, value: object | None) -> int | None:
+        if value is None or value == "":
+            return None
+        if isinstance(value, int):
+            return value if value > 0 else None
+        if not isinstance(value, str):
+            return None
+        try:
+            parsed = int(value.strip())
+        except ValueError:
+            return None
+        return parsed if parsed > 0 else None
+
+    def _resolve_time_span(
+        self,
+        *,
+        start_at: datetime | None,
+        due_at: datetime | None,
+        end_at: datetime | None,
+        duration_minutes: int | None,
+    ) -> tuple[datetime | None, datetime | None, datetime | None]:
+        resolved_end_at = end_at
+        if resolved_end_at is None and start_at is not None and duration_minutes is not None:
+            resolved_end_at = start_at + timedelta(minutes=duration_minutes)
+        resolved_due_at = due_at
+        if resolved_due_at is None and resolved_end_at is not None:
+            resolved_due_at = resolved_end_at
+        return start_at, resolved_due_at, resolved_end_at
 
     def _coerce_datetime(self, value: object | None) -> datetime | None:
         if value is None or value == "":

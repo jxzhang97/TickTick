@@ -486,6 +486,275 @@ async def test_handle_update_executes_update_action_when_ticktick_connected() ->
 
 
 @pytest.mark.asyncio
+async def test_handle_update_processes_memo_cleanup_schedule_reply() -> None:
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        user = User(
+            telegram_user_id="99",
+            display_name="Jiaxin",
+            current_timezone="America/Los_Angeles",
+            ticktick_access_token="access-token",
+        )
+        session.add(user)
+        session.flush()
+        session.add(
+            ReminderEvent(
+                user_id=user.id,
+                event_type="memo_cleanup",
+                scheduled_at=datetime.fromisoformat("2026-03-29T17:00:00-07:00"),
+                dedupe_key="memo-cleanup-1",
+                status="sent",
+                payload_json={
+                    "candidate_tasks": [
+                        {"task_id": "memo-1", "title": "整理发票", "description": "周末"},
+                    ]
+                },
+            )
+        )
+        session.commit()
+
+    planner = FakePlanner(
+        PlannedConversation(
+            actions=[
+                {
+                    "action_type": "update_task",
+                    "payload": {
+                        "due_at": "2026-03-30T10:00:00-07:00",
+                        "semantic_type": "explicit_time",
+                    },
+                }
+            ]
+        )
+    )
+    task_command_service = FakeTaskCommandService("好，我已经替你改好了：周一 10:00 整理发票")
+    service = ConversationService(
+        planner=planner,
+        task_command_service=task_command_service,
+        session_factory=session_factory,
+        memory_service=MemoryService(session_factory=session_factory),
+    )
+    update = TelegramUpdate.model_validate(
+        {
+            "update_id": 7_1,
+            "message": {
+                "message_id": 13_1,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "把第1条安排到明天上午10点",
+            },
+        }
+    )
+
+    replies = await service.handle_update(update)
+
+    assert [reply.text for reply in replies] == ["好，我已经替你改好了：周一 10:00 整理发票"]
+    assert len(task_command_service.calls) == 1
+    action = task_command_service.calls[0]["action"]
+    assert action.action_type == "update_task"
+    assert action.target_task_id == "memo-1"
+    assert action.payload["match_title"] == "整理发票"
+    assert action.payload["semantic_type"] == "explicit_time"
+
+
+@pytest.mark.asyncio
+async def test_handle_update_processes_memo_cleanup_keep_reply() -> None:
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        user = User(
+            telegram_user_id="99",
+            display_name="Jiaxin",
+            current_timezone="America/Los_Angeles",
+            ticktick_access_token="access-token",
+        )
+        session.add(user)
+        session.flush()
+        session.add(
+            ReminderEvent(
+                user_id=user.id,
+                event_type="memo_cleanup",
+                scheduled_at=datetime.fromisoformat("2026-03-29T17:00:00-07:00"),
+                dedupe_key="memo-cleanup-keep",
+                status="sent",
+                payload_json={
+                    "candidate_tasks": [
+                        {"task_id": "memo-1", "title": "整理发票", "description": "周末"},
+                    ]
+                },
+            )
+        )
+        session.commit()
+
+    task_command_service = FakeTaskCommandService()
+    service = ConversationService(
+        task_command_service=task_command_service,
+        session_factory=session_factory,
+        memory_service=MemoryService(session_factory=session_factory),
+    )
+    update = TelegramUpdate.model_validate(
+        {
+            "update_id": 7_2,
+            "message": {
+                "message_id": 13_2,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "先都留着",
+            },
+        }
+    )
+
+    replies = await service.handle_update(update)
+
+    assert [reply.text for reply in replies] == ["好，那我先继续把这些留在备忘池里，等你想安排时间时再叫我。"]
+    assert task_command_service.calls == []
+
+
+@pytest.mark.asyncio
+async def test_handle_update_requests_confirmation_for_overlapping_span_task() -> None:
+    planner = FakePlanner(
+        PlannedConversation(
+            actions=[
+                {
+                    "action_type": "create_task",
+                    "payload": {
+                        "title": "项目复盘",
+                        "semantic_type": "explicit_time",
+                        "start_at": "2026-03-28T15:00:00-07:00",
+                        "duration_minutes": 60,
+                    },
+                }
+            ]
+        )
+    )
+    oauth_service = FakeTickTickOAuthService(connected=True, auth_url=None)
+    ticktick_client = FakeTickTickClient(
+        tasks=[
+            TickTickTask(
+                id="task-1",
+                projectId="telegram-inbox",
+                title="导师会议",
+                startDate="2026-03-28T15:30:00.000-0700",
+                dueDate="2026-03-28T16:30:00.000-0700",
+                status=0,
+            )
+        ]
+    )
+    task_command_service = FakeTaskCommandService()
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        session.add(
+            User(
+                telegram_user_id="99",
+                display_name="Jiaxin",
+                current_timezone="America/Los_Angeles",
+                ticktick_access_token="access-token",
+            )
+        )
+        session.commit()
+
+    service = ConversationService(
+        planner=planner,
+        ticktick_oauth_service=oauth_service,
+        task_command_service=task_command_service,
+        ticktick_client=ticktick_client,
+        session_factory=session_factory,
+        memory_service=MemoryService(session_factory=session_factory),
+    )
+    update = TelegramUpdate.model_validate(
+        {
+            "update_id": 7_3,
+            "message": {
+                "message_id": 13_3,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "明天下午3点到4点项目复盘",
+            },
+        }
+    )
+
+    replies = await service.handle_update(update)
+
+    assert len(replies) == 1
+    assert "撞上了" in replies[0].text
+    assert task_command_service.calls == []
+
+
+@pytest.mark.asyncio
+async def test_handle_update_persists_planner_confirmation_and_resumes_it() -> None:
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        user = User(
+            telegram_user_id="99",
+            display_name="Jiaxin",
+            current_timezone="America/Los_Angeles",
+            ticktick_access_token="access-token",
+        )
+        session.add(user)
+        session.flush()
+        user_id = user.id
+        session.commit()
+
+    planner = FakePlanner(
+        [
+            PlannedConversation(
+                requires_confirmation=True,
+                assistant_reply="这个改动看起来有点高风险，要我继续吗？",
+            ),
+            PlannedConversation(
+                actions=[
+                    {
+                        "action_type": "update_task",
+                        "payload": {
+                            "match_title": "weekly sync",
+                            "due_at": "2026-03-28T15:00:00-07:00",
+                        },
+                    }
+                ]
+            ),
+        ]
+    )
+    task_command_service = FakeTaskCommandService("好，我已经替你改好了：周六 15:00 weekly sync")
+    memory_service = MemoryService(session_factory=session_factory)
+    service = ConversationService(
+        planner=planner,
+        task_command_service=task_command_service,
+        session_factory=session_factory,
+        memory_service=memory_service,
+    )
+    first_update = TelegramUpdate.model_validate(
+        {
+            "update_id": 7_1,
+            "message": {
+                "message_id": 13_1,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "把 weekly sync 改到明天下午3点",
+            },
+        }
+    )
+    second_update = TelegramUpdate.model_validate(
+        {
+            "update_id": 7_2,
+            "message": {
+                "message_id": 13_2,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "继续",
+            },
+        }
+    )
+
+    first_replies = await service.handle_update(first_update)
+    second_replies = await service.handle_update(second_update)
+
+    assert [reply.text for reply in first_replies] == ["这个改动看起来有点高风险，要我继续吗？"]
+    assert [reply.text for reply in second_replies] == ["好，我已经替你改好了：周六 15:00 weekly sync"]
+    assert planner.contexts[1].user_text == "把 weekly sync 改到明天下午3点\n用户确认：继续"
+    assert len(task_command_service.calls) == 1
+    assert task_command_service.calls[0]["action"].action_type == "update_task"
+    assert memory_service.get_active_context(user_id=user_id, context_type="pending_confirmation") is None
+
+
+@pytest.mark.asyncio
 async def test_handle_update_reuses_last_task_context_for_follow_up_edit() -> None:
     planner = FakePlanner(
         [
@@ -638,6 +907,73 @@ async def test_handle_update_processes_multiline_batch_sequentially() -> None:
         "task-created-1",
         "task-created-1",
     ]
+
+
+@pytest.mark.asyncio
+async def test_handle_update_processes_following_batch_lines_after_confirmation_prompt() -> None:
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        user = User(
+            telegram_user_id="99",
+            display_name="Jiaxin",
+            current_timezone="America/Los_Angeles",
+            ticktick_access_token="access-token",
+        )
+        session.add(user)
+        session.commit()
+
+    planner = FakePlanner(
+        [
+            PlannedConversation(
+                requires_confirmation=True,
+                assistant_reply="这条改动有点高风险，要我继续吗？",
+            ),
+            PlannedConversation(
+                actions=[
+                    {
+                        "action_type": "create_task",
+                        "payload": {
+                            "title": "给导师发邮件",
+                            "semantic_type": "explicit_time",
+                            "due_at": "2026-03-28T15:00:00-07:00",
+                        },
+                    }
+                ]
+            ),
+        ]
+    )
+    task_command_service = FakeTaskCommandService("ok")
+    memory_service = MemoryService(session_factory=session_factory)
+    service = ConversationService(
+        planner=planner,
+        task_command_service=task_command_service,
+        session_factory=session_factory,
+        memory_service=memory_service,
+    )
+    update = TelegramUpdate.model_validate(
+        {
+            "update_id": 10_1,
+            "message": {
+                "message_id": 16_1,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "把 weekly sync 改到明天下午3点\n明天下午4点提醒我给导师发邮件",
+            },
+        }
+    )
+
+    replies = await service.handle_update(update)
+
+    assert [reply.text for reply in replies] == ["这条改动有点高风险，要我继续吗？\nok"]
+    assert planner.contexts[0].user_text == "把 weekly sync 改到明天下午3点"
+    assert planner.contexts[1].user_text == "明天下午4点提醒我给导师发邮件"
+    assert len(task_command_service.calls) == 1
+    assert task_command_service.calls[0]["action"].action_type == "create_task"
+    with session_factory() as session:
+        user = session.query(User).filter(User.telegram_user_id == "99").one()
+    context = memory_service.get_active_context(user_id=user.id, context_type="pending_confirmation")
+    assert context is not None
+    assert context.payload_json["kind"] == "planner_confirmation"
 
 
 @pytest.mark.asyncio
@@ -946,7 +1282,11 @@ async def test_handle_update_builds_planner_context_from_memory_service() -> Non
 
     await service.handle_update(update)
 
-    assert planner.contexts[0].memory_items == ["alias_mapping: fun list -> fun"]
+    assert planner.contexts[0].recent_conversation_summaries == ["最近提到：放到 fun 那个 list"]
+    assert planner.contexts[0].memory_items == [
+        "conversation_summary: 最近提到：放到 fun 那个 list",
+        "alias_mapping: fun list -> fun",
+    ]
 
 
 @pytest.mark.asyncio

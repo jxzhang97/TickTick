@@ -66,6 +66,7 @@ Use the helper script:
 - TickTick OAuth callback is exposed locally at `/auth/ticktick/callback`.
 - To complete TickTick OAuth on a self-hosted Mac, `PUBLIC_BASE_URL` must point to a temporary or permanent HTTPS address that can reach the local API.
 - If Docker is unavailable, set `DATABASE_URL=sqlite:///./assistant.db` and the helper script will skip Postgres startup.
+- The Studio sync helper preserves `state/` so Telegram polling offset state survives deploys.
 - For Mac Studio deployment and `launchd` setup, see `docs/runbooks/mac-studio-deploy.md`.
 
 ## Verification

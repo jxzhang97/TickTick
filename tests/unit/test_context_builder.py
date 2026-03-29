@@ -16,6 +16,7 @@ def test_build_includes_memory_items_and_candidate_tasks() -> None:
             "alias_mapping: 老王 -> 王老师",
             "time_expression: 明天下午 -> 2026-03-28T15:00:00-07:00",
         ],
+        recent_conversation_summaries=["用户刚说过希望回复简短。"],
         candidate_tasks=["task-1: 给导师发邮件"],
     )
 
@@ -26,6 +27,7 @@ def test_build_includes_memory_items_and_candidate_tasks() -> None:
         "alias_mapping: 老王 -> 王老师",
         "time_expression: 明天下午 -> 2026-03-28T15:00:00-07:00",
     ]
+    assert context.recent_conversation_summaries == ["用户刚说过希望回复简短。"]
     assert context.candidate_tasks == ["task-1: 给导师发邮件"]
 
 

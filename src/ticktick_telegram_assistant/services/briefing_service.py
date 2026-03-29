@@ -13,9 +13,9 @@ class BriefingService:
         ddl_items: list[dict],
         windowed_items: list[dict],
     ) -> str:
-        sections: list[str] = ["早呀，今天先抓重点："]
+        sections: list[str] = ["早呀，今天先看这几块："]
         if top_items:
-            sections.append("最重要的几件：")
+            sections.append("今天最重要的几件：")
             sections.extend(f"- {self._renderer.render_task_line(item)}" for item in top_items)
         if scheduled_items:
             sections.append("今天有明确时间的安排：")
@@ -24,6 +24,6 @@ class BriefingService:
             sections.append("未来 7 天的 ddl：")
             sections.extend(f"- {self._renderer.render_task_line(item)}" for item in ddl_items)
         if windowed_items:
-            sections.append("这几天要推进的事：")
+            sections.append("这几天要推进的时间窗口任务：")
             sections.extend(f"- {self._renderer.render_task_line(item)}" for item in windowed_items)
         return "\n".join(sections)

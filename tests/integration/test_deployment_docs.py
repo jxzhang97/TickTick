@@ -6,6 +6,7 @@ def test_deployment_docs_cover_env_and_local_postgres() -> None:
     readme = Path("README.md").read_text(encoding="utf-8")
     compose = Path("docker-compose.yml")
     runbook = Path("docs/runbooks/mac-studio-deploy.md")
+    sync_script = Path("scripts/sync_to_studio.sh")
     launchd_plist = Path("deploy/macos/com.jxzhang.ticktick-assistant.plist")
     run_script = Path("scripts/run_local_assistant.sh")
 
@@ -20,6 +21,10 @@ def test_deployment_docs_cover_env_and_local_postgres() -> None:
     assert "sqlite:///./assistant.db" in runbook.read_text(encoding="utf-8")
     assert "launchctl" in runbook.read_text(encoding="utf-8")
     assert "/Users/jiaxin/doc_unsyn/TickTick_Codex" in runbook.read_text(encoding="utf-8")
+    assert "state/" in runbook.read_text(encoding="utf-8")
+    assert "state/" in readme
+    assert sync_script.exists()
+    assert "state/" in sync_script.read_text(encoding="utf-8")
     assert launchd_plist.exists()
     assert "/Users/jiaxin/doc_unsyn/TickTick_Codex" in launchd_plist.read_text(encoding="utf-8")
     assert run_script.exists()

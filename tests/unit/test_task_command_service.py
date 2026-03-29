@@ -206,6 +206,67 @@ async def test_execute_action_creates_task_with_repeat_priority_tags_and_checkli
 
 
 @pytest.mark.asyncio
+async def test_execute_action_normalizes_repeat_phrase_and_time_span() -> None:
+    from ticktick_telegram_assistant.services.task_command_service import TaskCommandService
+
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        session.add(
+            User(
+                telegram_user_id="99",
+                display_name="Jiaxin",
+                current_timezone="America/Los_Angeles",
+                ticktick_access_token="access-token",
+            )
+        )
+        session.commit()
+
+    client = FakeTickTickClient()
+    service = TaskCommandService(session_factory=session_factory, ticktick_client=client)
+
+    reply = await service.execute_action(
+        telegram_user_id="99",
+        action=PlannedAction(
+            action_type="create_task",
+            payload={
+                "title": "周五和导师开会",
+                "semantic_type": "explicit_time",
+                "start_at": "2026-04-03T17:00:00-07:00",
+                "duration_minutes": 90,
+                "repeat_rule": "每周五",
+            },
+        ),
+    )
+
+    assert "17:00-18:30" in reply
+    assert "FREQ=WEEKLY;BYDAY=FR" in reply
+    assert client.calls == [
+        {"method": "list_projects", "access_token": "access-token"},
+        {
+            "method": "create_task",
+            "access_token": "access-token",
+            "task": {
+                "title": "周五和导师开会",
+                "projectId": "telegram-inbox",
+                "content": "",
+                "desc": "",
+                "startDate": "2026-04-03T17:00:00-0700",
+                "dueDate": "2026-04-03T18:30:00-0700",
+                "timeZone": "America/Los_Angeles",
+                "reminders": [],
+                "repeatFlag": "FREQ=WEEKLY;BYDAY=FR",
+                "items": [],
+            },
+        },
+    ]
+
+    with session_factory() as session:
+        shadow = session.query(TaskShadow).one()
+        assert shadow.start_at == datetime.fromisoformat("2026-04-03T17:00:00-07:00").replace(tzinfo=None)
+        assert shadow.end_at == datetime.fromisoformat("2026-04-03T18:30:00-07:00").replace(tzinfo=None)
+
+
+@pytest.mark.asyncio
 async def test_execute_action_creates_windowed_task_with_shadow_metadata() -> None:
     from ticktick_telegram_assistant.services.task_command_service import TaskCommandService
 
@@ -465,6 +526,126 @@ async def test_execute_action_updates_repeat_rule_tags_and_checklist() -> None:
                 },
             },
         ]
+
+
+@pytest.mark.asyncio
+async def test_execute_action_updates_task_time_span_and_repeat_phrase() -> None:
+    from ticktick_telegram_assistant.services.task_command_service import TaskCommandService
+
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        session.add(
+            User(
+                telegram_user_id="99",
+                display_name="Jiaxin",
+                current_timezone="America/Los_Angeles",
+                ticktick_access_token="access-token",
+            )
+        )
+        session.commit()
+
+    client = FakeTickTickClient()
+    client.tasks = [
+        TickTickTask(
+            id="task-1",
+            projectId="telegram-inbox",
+            title="weekly sync",
+            desc="原说明",
+            status=0,
+        )
+    ]
+    service = TaskCommandService(session_factory=session_factory, ticktick_client=client)
+
+    reply = await service.execute_action(
+        telegram_user_id="99",
+        action=PlannedAction(
+            action_type="update_task",
+            payload={
+                "match_title": "weekly sync",
+                "start_at": "2026-03-28T15:00:00-07:00",
+                "end_at": "2026-03-28T16:30:00-07:00",
+                "repeat_rule": "工作日",
+            },
+        ),
+    )
+
+    assert "15:00-16:30" in reply
+    assert "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR" in reply
+    assert client.calls == [
+        {"method": "list_tasks", "access_token": "access-token", "since": None},
+        {
+            "method": "update_task",
+            "access_token": "access-token",
+            "task_id": "task-1",
+            "patch": {
+                "id": "task-1",
+                "projectId": "telegram-inbox",
+                "startDate": "2026-03-28T15:00:00-0700",
+                "dueDate": "2026-03-28T16:30:00-0700",
+                "timeZone": "America/Los_Angeles",
+                "repeatFlag": "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR",
+            },
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_execute_action_reclassifies_memo_shadow_when_scheduling_it() -> None:
+    from ticktick_telegram_assistant.services.task_command_service import TaskCommandService
+
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        user = User(
+            telegram_user_id="99",
+            display_name="Jiaxin",
+            current_timezone="America/Los_Angeles",
+            ticktick_access_token="access-token",
+        )
+        session.add(user)
+        session.flush()
+        session.add(
+            TaskShadow(
+                user_id=user.id,
+                ticktick_task_id="memo-1",
+                semantic_type="memo",
+                normalized_title="整理发票",
+                raw_nl_time="周末",
+            )
+        )
+        session.commit()
+
+    client = FakeTickTickClient()
+    client.tasks = [
+        TickTickTask(
+            id="memo-1",
+            projectId="telegram-inbox",
+            title="整理发票",
+            desc="周末看看",
+            status=0,
+        )
+    ]
+    service = TaskCommandService(session_factory=session_factory, ticktick_client=client)
+
+    reply = await service.execute_action(
+        telegram_user_id="99",
+        action=PlannedAction(
+            action_type="update_task",
+            target_task_id="memo-1",
+            payload={
+                "match_title": "整理发票",
+                "semantic_type": "explicit_time",
+                "due_at": "2026-03-30T10:00:00-07:00",
+            },
+        ),
+    )
+
+    assert "10:00" in reply
+    with session_factory() as session:
+        shadow = session.query(TaskShadow).one()
+        assert shadow.semantic_type == "explicit_time"
+        assert shadow.due_at == datetime.fromisoformat("2026-03-30T10:00:00-07:00").replace(tzinfo=None)
+        assert shadow.window_start is None
+        assert shadow.window_end is None
 
 
 @pytest.mark.asyncio

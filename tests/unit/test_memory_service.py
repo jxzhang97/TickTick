@@ -52,6 +52,14 @@ def test_memory_service_builds_context_with_relevant_memory_items() -> None:
     session_factory = make_session_factory()
     service = MemoryService(session_factory=session_factory)
 
+    service.save_conversation_summary(
+        user_id=99,
+        summary_text="用户偏好简短回复。",
+    )
+    service.save_conversation_summary(
+        user_id=99,
+        summary_text="用户提到明天下午要提醒。",
+    )
     with session_factory() as session:
         repo = MemoryRepository(session)
         repo.upsert_fact(
@@ -86,7 +94,13 @@ def test_memory_service_builds_context_with_relevant_memory_items() -> None:
     assert context.current_timezone == "America/Los_Angeles"
     assert context.current_local_time == "2026-03-27T09:00:00-07:00"
     assert context.candidate_tasks == ["task-1: 给导师发邮件"]
+    assert context.recent_conversation_summaries == [
+        "用户提到明天下午要提醒。",
+        "用户偏好简短回复。",
+    ]
     assert context.memory_items == [
+        "conversation_summary: 用户提到明天下午要提醒。",
+        "conversation_summary: 用户偏好简短回复。",
         "alias_mapping: 老王 -> 王老师",
         "time_expression: 明天下午 -> 2026-03-28T15:00:00-07:00",
     ]

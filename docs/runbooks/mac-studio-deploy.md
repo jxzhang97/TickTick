@@ -80,9 +80,11 @@ This preserves remote state that must never be touched during deploys:
 - `.env`
 - `.venv/`
 - `assistant.db`
+- `state/`
 - `logs/`
 
 Do not run a bare `rsync --delete` against the Studio checkout. For this local-hosted setup, preserving Studio state is more important than deleting stale files, because wiping `assistant.db` will erase the local OAuth/database state and force a new TickTick authorization.
+The `state/` directory also holds polling offset data, so preserving it prevents Telegram from replaying old updates after sync.
 
 ## Install launchd service
 

@@ -12,6 +12,7 @@ class ContextBuilder:
         current_timezone: str = "America/Los_Angeles",
         now: datetime | None = None,
         memory_items: list[str] | None = None,
+        recent_conversation_summaries: list[str] | None = None,
         candidate_tasks: list[str] | None = None,
     ) -> ConversationContext:
         current_dt = now.astimezone(ZoneInfo(current_timezone)) if now is not None else datetime.now(
@@ -22,6 +23,7 @@ class ContextBuilder:
             current_timezone=current_timezone,
             current_local_time=current_dt.isoformat(),
             memory_items=memory_items or [],
+            recent_conversation_summaries=recent_conversation_summaries or [],
             candidate_tasks=candidate_tasks or [],
         )
 
