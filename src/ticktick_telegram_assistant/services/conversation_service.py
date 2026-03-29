@@ -23,6 +23,7 @@ from ticktick_telegram_assistant.services.context_builder import ContextBuilder
 from ticktick_telegram_assistant.services.duplicate_detector import DuplicateDetector
 from ticktick_telegram_assistant.services.evening_review_service import EveningReviewService
 from ticktick_telegram_assistant.services.memory_service import MemoryService
+from ticktick_telegram_assistant.services.message_renderer import MessageRenderer
 from ticktick_telegram_assistant.services.reminder_service import ReminderService
 from ticktick_telegram_assistant.services.timezone_resolver import TimezoneResolver
 
@@ -81,6 +82,7 @@ class ConversationService:
         self._ticktick_client = ticktick_client
         self._duplicate_detector = duplicate_detector or DuplicateDetector()
         self._conflict_detector = conflict_detector or ConflictDetector()
+        self._message_renderer = MessageRenderer()
         self._user_timezones: dict[int, dict[str, str]] = {}
         self._active_task_contexts: dict[str, dict[str, str]] = {}
 
@@ -822,6 +824,22 @@ class ConversationService:
             self._clear_pending_confirmation(telegram_user_id=telegram_user_id)
             return TelegramReply(chat_id=update.message.chat.id, text=reply_text)
 
+        if context.get("kind") == "task_disambiguation":
+            candidate_tasks = context.get("candidate_tasks") or []
+            selected_index = self._extract_candidate_index(text=text, candidate_count=len(candidate_tasks))
+            if selected_index is None:
+                return TelegramReply(
+                    chat_id=update.message.chat.id,
+                    text="我先停在这一步。你可以直接回我“第一条”“第二条”“最后一个”，或者回“取消”。",
+                )
+            reply_text = await self._execute_task_disambiguation_confirmation(
+                telegram_user_id=telegram_user_id,
+                context=context,
+                selected_index=selected_index,
+            )
+            self._clear_pending_confirmation(telegram_user_id=telegram_user_id)
+            return TelegramReply(chat_id=update.message.chat.id, text=reply_text)
+
         if context.get("kind") == "planner_confirmation" and any(
             token in text for token in ("继续", "就它", "确认", "是", "好", "可以", "行")
         ):
@@ -980,7 +998,7 @@ class ConversationService:
         user = self._get_user_by_telegram_user_id(telegram_user_id)
         if user is None or not user.ticktick_access_token:
             return None
-        if action.action_type not in {"create_task", "update_task"}:
+        if action.action_type not in {"create_task", "update_task", "complete_task"}:
             return None
 
         tasks = await self._ticktick_client.list_tasks(access_token=user.ticktick_access_token, since=None)
@@ -995,6 +1013,37 @@ class ConversationService:
             end_at=end_at,
             duration_minutes=duration_minutes,
         )
+
+        if action.action_type in {"update_task", "complete_task"} and action.target_task_id is None:
+            candidate_tasks = self._find_disambiguation_candidates(
+                tasks=tasks,
+                requested_title=title,
+                exclude_task_id=action.target_task_id,
+            )
+            if len(candidate_tasks) > 1:
+                rendered_candidates = [
+                    {
+                        "task_id": candidate.id,
+                        "title": candidate.title,
+                        "when": self._render_task_candidate_label(
+                            task=candidate,
+                            current_timezone=user.current_timezone or "America/Los_Angeles",
+                        ),
+                    }
+                    for candidate in candidate_tasks[:5]
+                ]
+                self._save_pending_confirmation(
+                    telegram_user_id=telegram_user_id,
+                    payload={
+                        "kind": "task_disambiguation",
+                        "candidate_tasks": rendered_candidates,
+                        "original_action": action.model_dump(),
+                    },
+                )
+                return self._render_task_disambiguation_prompt(
+                    requested_title=title or "这条任务",
+                    candidates=rendered_candidates,
+                )
 
         duplicate_task = self._find_duplicate_task(tasks=tasks, title=title, exclude_task_id=action.target_task_id)
         if duplicate_task is not None and action.action_type == "create_task":
@@ -1127,6 +1176,29 @@ class ConversationService:
             action=action,
         )
 
+    async def _execute_task_disambiguation_confirmation(
+        self,
+        *,
+        telegram_user_id: str,
+        context: dict,
+        selected_index: int,
+    ) -> str:
+        candidate_tasks = context.get("candidate_tasks") or []
+        if not (0 <= selected_index < len(candidate_tasks)):
+            return "我知道你是在选任务，但这次没稳稳定位到你选的是哪一条。"
+        action = PlannedAction.model_validate(context["original_action"])
+        candidate = candidate_tasks[selected_index]
+        action.target_task_id = str(candidate.get("task_id") or "")
+        candidate_title = str(candidate.get("title") or "").strip()
+        if action.action_type == "update_task" and candidate_title:
+            action.payload.setdefault("match_title", candidate_title)
+        if action.action_type == "complete_task" and candidate_title:
+            action.payload["title"] = candidate_title
+        return await self._task_command_service.execute_action(
+            telegram_user_id=telegram_user_id,
+            action=action,
+        )
+
     def _save_pending_confirmation(self, *, telegram_user_id: str, payload: dict) -> None:
         if self._memory_service is None:
             return
@@ -1242,6 +1314,42 @@ class ConversationService:
                 return task
         return None
 
+    def _find_disambiguation_candidates(
+        self,
+        *,
+        tasks: list,
+        requested_title: str | None,
+        exclude_task_id: str | None,
+    ) -> list:
+        if not requested_title:
+            return []
+        normalized_title = self._normalize_title(requested_title)
+        open_tasks = [
+            task
+            for task in tasks
+            if not task.completed and (task.status is None or task.status == 0) and (not exclude_task_id or task.id != exclude_task_id)
+        ]
+        exact_matches = [task for task in open_tasks if self._normalize_title(task.title) == normalized_title]
+        if len(exact_matches) > 1:
+            return exact_matches
+        fuzzy_matches = [
+            task
+            for task in open_tasks
+            if normalized_title in self._normalize_title(task.title)
+            or self._normalize_title(task.title) in normalized_title
+            or self._duplicate_detector.is_probable_duplicate(task.title, requested_title)
+        ]
+        if len(fuzzy_matches) > 1:
+            unique_matches: list = []
+            seen_ids: set[str] = set()
+            for task in fuzzy_matches:
+                if task.id in seen_ids:
+                    continue
+                seen_ids.add(task.id)
+                unique_matches.append(task)
+            return unique_matches
+        return []
+
     def _find_conflicting_task(
         self,
         *,
@@ -1273,6 +1381,24 @@ class ConversationService:
             ):
                 return task
         return None
+
+    def _render_task_disambiguation_prompt(self, *, requested_title: str, candidates: list[dict]) -> str:
+        lines = [f"我找到不止一条和“{requested_title}”对应的未完成任务。你是指哪一条？"]
+        for index, candidate in enumerate(candidates, start=1):
+            label = str(candidate.get("when") or candidate.get("title") or "").strip()
+            title = str(candidate.get("title") or "").strip()
+            if label and title:
+                lines.append(f"{index}. {label} {title}".strip())
+            elif title:
+                lines.append(f"{index}. {title}")
+        lines.append("你直接回我“第一条”“第二条”或者“最后一个”就行。")
+        return "\n".join(lines)
+
+    def _render_task_candidate_label(self, *, task, current_timezone: str) -> str:
+        when = self._parse_ticktick_datetime(task.startDate or task.dueDate, timezone_name=current_timezone)
+        if when is None:
+            return ""
+        return f"{self._message_renderer.render_weekday(when)} {when.strftime('%H:%M')}"
 
     def _extract_candidate_index(self, *, text: str, candidate_count: int) -> int | None:
         if candidate_count <= 0:

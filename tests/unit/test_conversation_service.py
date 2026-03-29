@@ -1546,3 +1546,148 @@ async def test_handle_update_requests_confirmation_for_time_conflict() -> None:
     assert "撞上了" in replies[0].text
     assert "周会" in replies[0].text
     assert task_command_service.calls == []
+
+
+@pytest.mark.asyncio
+async def test_handle_update_requests_numbered_confirmation_for_ambiguous_update() -> None:
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        session.add(
+            User(
+                telegram_user_id="99",
+                display_name="Jiaxin",
+                current_timezone="America/Los_Angeles",
+                ticktick_access_token="access-token",
+            )
+        )
+        session.commit()
+
+    planner = FakePlanner(
+        PlannedConversation(
+            actions=[
+                {
+                    "action_type": "update_task",
+                    "payload": {
+                        "match_title": "给导师A发邮件",
+                        "description": "记得带附件",
+                    },
+                }
+            ]
+        )
+    )
+    ticktick_client = FakeTickTickClient(
+        tasks=[
+            TickTickTask(
+                id="existing-1",
+                projectId="telegram-inbox",
+                title="给导师A发邮件",
+                dueDate="2026-03-29T15:00:00.000-0700",
+                status=0,
+            ),
+            TickTickTask(
+                id="existing-2",
+                projectId="telegram-inbox",
+                title="给导师A发邮件",
+                dueDate="2026-03-30T15:00:00.000-0700",
+                status=0,
+            ),
+        ]
+    )
+    memory_service = MemoryService(session_factory=session_factory)
+    task_command_service = FakeTaskCommandService("should-not-run")
+    service = ConversationService(
+        planner=planner,
+        task_command_service=task_command_service,
+        session_factory=session_factory,
+        ticktick_client=ticktick_client,
+        memory_service=memory_service,
+    )
+
+    update = TelegramUpdate.model_validate(
+        {
+            "update_id": 20,
+            "message": {
+                "message_id": 26,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "给导师A发邮件再补一句说明：记得带附件",
+            },
+        }
+    )
+
+    replies = await service.handle_update(update)
+
+    assert len(replies) == 1
+    assert "你是指哪一条" in replies[0].text
+    assert "1." in replies[0].text
+    assert "2." in replies[0].text
+    assert task_command_service.calls == []
+    with session_factory() as session:
+        user = session.query(User).filter(User.telegram_user_id == "99").one()
+    context = memory_service.get_active_context(user_id=user.id, context_type="pending_confirmation")
+    assert context is not None
+    assert context.payload_json["kind"] == "task_disambiguation"
+    assert len(context.payload_json["candidate_tasks"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_handle_update_executes_numbered_reply_for_task_disambiguation() -> None:
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        user = User(
+            telegram_user_id="99",
+            display_name="Jiaxin",
+            current_timezone="America/Los_Angeles",
+            ticktick_access_token="access-token",
+        )
+        session.add(user)
+        session.flush()
+        user_id = user.id
+        session.commit()
+
+    memory_service = MemoryService(session_factory=session_factory)
+    memory_service.replace_active_context(
+        user_id=user_id,
+        context_type="pending_confirmation",
+        payload_json={
+            "kind": "task_disambiguation",
+            "candidate_tasks": [
+                {"task_id": "existing-1", "title": "给导师A发邮件"},
+                {"task_id": "existing-2", "title": "给导师A发邮件"},
+            ],
+            "original_action": {
+                "action_type": "update_task",
+                "payload": {
+                    "match_title": "给导师A发邮件",
+                    "description": "记得带附件",
+                },
+            },
+        },
+    )
+    task_command_service = FakeTaskCommandService("updated")
+    service = ConversationService(
+        task_command_service=task_command_service,
+        session_factory=session_factory,
+        memory_service=memory_service,
+    )
+    update = TelegramUpdate.model_validate(
+        {
+            "update_id": 21,
+            "message": {
+                "message_id": 27,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "第二条",
+            },
+        }
+    )
+
+    replies = await service.handle_update(update)
+
+    assert [reply.text for reply in replies] == ["updated"]
+    assert len(task_command_service.calls) == 1
+    action = task_command_service.calls[0]["action"]
+    assert action.action_type == "update_task"
+    assert action.target_task_id == "existing-2"
+    assert action.payload["match_title"] == "给导师A发邮件"
+    assert memory_service.get_active_context(user_id=user_id, context_type="pending_confirmation") is None
