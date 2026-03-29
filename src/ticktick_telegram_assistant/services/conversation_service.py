@@ -1032,12 +1032,17 @@ class ConversationService:
                 return None
 
             text = update.message.text.strip()
+            if len(self._context_builder.split_lines(text)) > 1:
+                self._clear_pending_batch(telegram_user_id=telegram_user_id)
+                return None
             if any(token in text for token in ("取消", "算了", "不用了", "不要了")):
                 self._clear_pending_batch(telegram_user_id=telegram_user_id)
                 return TelegramReply(chat_id=update.message.chat.id, text="好，我先不动这些待确认项。")
 
             batch_entries = batch_context.get("entries") or []
             selected_index = self._extract_candidate_index(text=text, candidate_count=len(batch_entries))
+            if selected_index is None and len(batch_entries) == 1 and self._looks_like_pending_batch_continue(text):
+                selected_index = 0
             if selected_index is None:
                 return TelegramReply(
                     chat_id=update.message.chat.id,
@@ -1696,6 +1701,12 @@ class ConversationService:
         if not any(token in text or token in lowered for token in ("要我", "要不要", "帮你", "列出", "看看", "捋一遍")):
             return False
         return "吗" in text or "？" in text or "?" in text
+
+    def _looks_like_pending_batch_continue(self, text: str) -> bool:
+        lowered = text.casefold().strip()
+        if lowered in {"继续", "继续吧", "继续呀", "继续啊", "对", "是", "好", "好的", "行", "可以", "嗯"}:
+            return True
+        return "继续" in text
 
     def _save_pending_query(self, *, telegram_user_id: str, payload: dict) -> None:
         if self._memory_service is None:

@@ -1349,6 +1349,73 @@ async def test_handle_update_normalizes_bulleted_multiline_batch_before_planning
 
 
 @pytest.mark.asyncio
+async def test_handle_update_new_multiline_batch_is_not_hijacked_by_stale_pending_batch() -> None:
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        user = User(
+            telegram_user_id="99",
+            display_name="Jiaxin",
+            current_timezone="America/Los_Angeles",
+            ticktick_access_token="access-token",
+        )
+        session.add(user)
+        session.flush()
+        user_id = user.id
+        session.commit()
+
+    memory_service = MemoryService(session_factory=session_factory)
+    memory_service.replace_active_context(
+        user_id=user_id,
+        context_type="pending_batch",
+        payload_json={
+            "kind": "multiline_batch_pending",
+            "entries": [
+                {
+                    "context_type": "pending_query",
+                    "line_text": "旧的待继续项",
+                    "payload": {"kind": "structured_query", "query": {"query_kind": "schedule_query", "time_scope": "recent"}},
+                }
+            ],
+        },
+    )
+    planner = FakePlanner(
+        [
+            PlannedConversation(actions=[{"action_type": "complete_task", "payload": {"title": "和家里打电话"}}]),
+            PlannedConversation(actions=[{"action_type": "update_task", "payload": {"match_title": "回复PRL Referee"}}]),
+        ]
+    )
+    oauth_service = FakeTickTickOAuthService(connected=True, auth_url=None)
+    task_command_service = FakeTaskCommandService(reply_text="ok")
+    service = ConversationService(
+        planner=planner,
+        ticktick_oauth_service=oauth_service,
+        task_command_service=task_command_service,
+        session_factory=session_factory,
+        memory_service=memory_service,
+    )
+    update = TelegramUpdate.model_validate(
+        {
+            "update_id": 10_2,
+            "message": {
+                "message_id": 16_2,
+                "from": {"id": 99},
+                "chat": {"id": 99, "type": "private"},
+                "text": "• 和家里打电话已完成\n• 回复PRL Referee 改到 4月3号",
+            },
+        }
+    )
+
+    replies = await service.handle_update(update)
+
+    assert [reply.text for reply in replies] == ["ok\nok"]
+    assert [context.user_text for context in planner.contexts] == [
+        "和家里打电话完成了",
+        "回复PRL Referee 改到 4月3号",
+    ]
+    assert memory_service.get_active_context(user_id=user_id, context_type="pending_batch") is None
+
+
+@pytest.mark.asyncio
 async def test_handle_update_processes_following_batch_lines_after_confirmation_prompt() -> None:
     session_factory = make_session_factory()
     with session_factory() as session:
