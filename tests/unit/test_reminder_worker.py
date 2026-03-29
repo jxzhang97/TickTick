@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
+import httpx
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -23,12 +24,22 @@ class FakeTelegramClient:
 
 
 class FakeTickTickClient:
-    def __init__(self, tasks: list[TickTickTask]) -> None:
+    def __init__(
+        self,
+        tasks: list[TickTickTask],
+        *,
+        fail_on_call_numbers: set[int] | None = None,
+        error: Exception | None = None,
+    ) -> None:
         self.tasks = tasks
         self.calls: list[dict] = []
+        self.fail_on_call_numbers = fail_on_call_numbers or set()
+        self.error = error or RuntimeError("ticktick list_tasks failed")
 
     async def list_tasks(self, *, access_token: str, since=None) -> list[TickTickTask]:
         self.calls.append({"method": "list_tasks", "access_token": access_token, "since": since})
+        if len(self.calls) in self.fail_on_call_numbers:
+            raise self.error
         return list(self.tasks)
 
 
@@ -198,6 +209,75 @@ async def test_reminder_worker_backfills_morning_brief_after_missed_trigger() ->
 
 
 @pytest.mark.asyncio
+async def test_reminder_worker_queues_and_backfills_morning_brief_when_ticktick_fetch_recovers() -> None:
+    from ticktick_telegram_assistant.workers.reminder_worker import ReminderWorker
+
+    request = httpx.Request("GET", "https://api.ticktick.com/open/v1/project")
+    response = httpx.Response(500, request=request)
+    ticktick_error = httpx.HTTPStatusError("temporary failure", request=request, response=response)
+
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        session.add(
+            User(
+                telegram_user_id="99",
+                display_name="Jiaxin",
+                current_timezone="America/Los_Angeles",
+                ticktick_access_token="access-token",
+            )
+        )
+        session.commit()
+
+    ticktick_client = FakeTickTickClient(
+        [
+            TickTickTask(
+                id="t1",
+                projectId="telegram-inbox",
+                title="周五讨论",
+                dueDate="2026-03-27T21:00:00.000+0000",
+                status=0,
+            )
+        ],
+        fail_on_call_numbers={1},
+        error=ticktick_error,
+    )
+    telegram_client = FakeTelegramClient()
+    worker = ReminderWorker(
+        session_factory=session_factory,
+        ticktick_client=ticktick_client,
+        telegram_client=telegram_client,
+    )
+
+    first_run_at = datetime.fromisoformat("2026-03-27T08:00:10-07:00")
+    try:
+        await worker.run_once(now=first_run_at)
+    except httpx.HTTPStatusError as exc:
+        pytest.fail(f"morning brief fetch failure should be queued locally, not raised: {exc}")
+
+    assert telegram_client.sent_messages == []
+    with session_factory() as session:
+        reminders = session.query(ReminderEvent).all()
+        assert len(reminders) == 1
+        reminder = reminders[0]
+        assert reminder.event_type == "morning_brief"
+        assert reminder.status == "pending"
+        assert reminder.dedupe_key == "morning_brief:2026-03-27"
+
+    ticktick_client.fail_on_call_numbers.clear()
+    await worker.run_once(now=datetime.fromisoformat("2026-03-27T08:05:10-07:00"))
+
+    assert len(telegram_client.sent_messages) == 1
+    assert "早呀" in telegram_client.sent_messages[0]["text"]
+    with session_factory() as session:
+        reminders = session.query(ReminderEvent).all()
+        assert len(reminders) == 1
+        reminder = reminders[0]
+        assert reminder.event_type == "morning_brief"
+        assert reminder.status == "sent"
+        assert reminder.sent_at is not None
+
+
+@pytest.mark.asyncio
 async def test_reminder_worker_morning_brief_shows_time_range_for_span_task() -> None:
     from ticktick_telegram_assistant.workers.reminder_worker import ReminderWorker
 
@@ -289,6 +369,52 @@ async def test_reminder_worker_sends_prestart_reminder_once() -> None:
 
 
 @pytest.mark.asyncio
+async def test_reminder_worker_sends_just_missed_prestart_catch_up_reminder() -> None:
+    from ticktick_telegram_assistant.workers.reminder_worker import ReminderWorker
+
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        session.add(
+            User(
+                telegram_user_id="99",
+                display_name="Jiaxin",
+                current_timezone="America/Los_Angeles",
+                ticktick_access_token="access-token",
+            )
+        )
+        session.commit()
+
+    ticktick_client = FakeTickTickClient(
+        [
+            TickTickTask(
+                id="t1",
+                projectId="telegram-inbox",
+                title="周五讨论",
+                dueDate="2026-03-27T14:00:00.000-0700",
+                status=0,
+            )
+        ]
+    )
+    telegram_client = FakeTelegramClient()
+    worker = ReminderWorker(
+        session_factory=session_factory,
+        ticktick_client=ticktick_client,
+        telegram_client=telegram_client,
+    )
+
+    await worker.run_once(now=datetime.fromisoformat("2026-03-27T14:00:45-07:00"))
+
+    assert len(telegram_client.sent_messages) == 1
+    message = telegram_client.sent_messages[0]["text"]
+    assert "刚刚错过" in message
+    assert "周五讨论" in message
+    with session_factory() as session:
+        reminder = session.query(ReminderEvent).one()
+        assert reminder.event_type == "prestart_reminder"
+        assert reminder.status == "sent"
+
+
+@pytest.mark.asyncio
 async def test_reminder_worker_anchors_span_tasks_on_start_time() -> None:
     from ticktick_telegram_assistant.workers.reminder_worker import ReminderWorker
 
@@ -329,7 +455,6 @@ async def test_reminder_worker_anchors_span_tasks_on_start_time() -> None:
     message = telegram_client.sent_messages[0]["text"]
     assert "14:00" in message
     assert "18:00" not in message
-
 
 @pytest.mark.asyncio
 async def test_reminder_worker_sends_evening_review_once() -> None:
@@ -419,6 +544,74 @@ async def test_reminder_worker_backfills_evening_review_after_midnight_restart()
 
     assert len(telegram_client.sent_messages) == 1
     assert "今天这些事哪些已经做完了" in telegram_client.sent_messages[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_reminder_worker_queues_and_backfills_evening_review_when_ticktick_fetch_recovers() -> None:
+    from ticktick_telegram_assistant.workers.reminder_worker import ReminderWorker
+
+    request = httpx.Request("GET", "https://api.ticktick.com/open/v1/project")
+    response = httpx.Response(500, request=request)
+    ticktick_error = httpx.HTTPStatusError("temporary failure", request=request, response=response)
+
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        session.add(
+            User(
+                telegram_user_id="99",
+                display_name="Jiaxin",
+                current_timezone="America/Los_Angeles",
+                ticktick_access_token="access-token",
+            )
+        )
+        session.commit()
+
+    ticktick_client = FakeTickTickClient(
+        [
+            TickTickTask(
+                id="t1",
+                projectId="telegram-inbox",
+                title="周五讨论",
+                dueDate="2026-03-27T21:00:00.000+0000",
+                status=0,
+            )
+        ],
+        fail_on_call_numbers={1},
+        error=ticktick_error,
+    )
+    telegram_client = FakeTelegramClient()
+    worker = ReminderWorker(
+        session_factory=session_factory,
+        ticktick_client=ticktick_client,
+        telegram_client=telegram_client,
+    )
+
+    try:
+        await worker.run_once(now=datetime.fromisoformat("2026-03-27T23:30:10-07:00"))
+    except httpx.HTTPStatusError as exc:
+        pytest.fail(f"evening review fetch failure should be queued locally, not raised: {exc}")
+
+    assert telegram_client.sent_messages == []
+    with session_factory() as session:
+        reminders = session.query(ReminderEvent).all()
+        assert len(reminders) == 1
+        reminder = reminders[0]
+        assert reminder.event_type == "evening_review"
+        assert reminder.status == "pending"
+        assert reminder.dedupe_key == "evening_review:2026-03-27"
+
+    ticktick_client.fail_on_call_numbers.clear()
+    await worker.run_once(now=datetime.fromisoformat("2026-03-28T00:10:00-07:00"))
+
+    assert len(telegram_client.sent_messages) == 1
+    assert "今天这些事哪些已经做完了" in telegram_client.sent_messages[0]["text"]
+    with session_factory() as session:
+        reminders = session.query(ReminderEvent).all()
+        assert len(reminders) == 1
+        reminder = reminders[0]
+        assert reminder.event_type == "evening_review"
+        assert reminder.status == "sent"
+        assert reminder.sent_at is not None
 
 
 @pytest.mark.asyncio

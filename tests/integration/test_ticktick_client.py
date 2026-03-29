@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 
 import httpx
@@ -125,3 +126,109 @@ async def test_ticktick_client_serializes_advanced_task_fields() -> None:
             },
         },
     ]
+
+
+@pytest.mark.asyncio
+async def test_ticktick_client_retries_transient_5xx_and_eventually_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    attempts = 0
+    sleep_delays: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleep_delays.append(delay)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            return httpx.Response(503, json={"detail": "temporarily unavailable"})
+        body = json.loads(request.content.decode()) if request.content else {}
+        return httpx.Response(
+            200,
+            json={
+                "id": "task-1",
+                "projectId": body["projectId"],
+                "title": body["title"],
+            },
+        )
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="https://developer.ticktick.com") as http_client:
+        client = TickTickClient(base_url="https://developer.ticktick.com", http_client=http_client)
+
+        created = await client.create_task(
+            access_token="token",
+            task=TickTickTaskCreate(
+                title="需要重试的任务",
+                projectId="inbox",
+            ),
+        )
+
+    assert created.id == "task-1"
+    assert attempts == 3
+    assert sleep_delays == [1.0, 2.0]
+
+
+@pytest.mark.asyncio
+async def test_ticktick_client_does_not_retry_4xx_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    attempts = 0
+    sleep_delays: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleep_delays.append(delay)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(400, json={"detail": "bad request"})
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="https://developer.ticktick.com") as http_client:
+        client = TickTickClient(base_url="https://developer.ticktick.com", http_client=http_client)
+
+        with pytest.raises(httpx.HTTPStatusError):
+            await client.create_task(
+                access_token="token",
+                task=TickTickTaskCreate(
+                    title="不该重试的任务",
+                    projectId="inbox",
+                ),
+            )
+
+    assert attempts == 1
+    assert sleep_delays == []
+
+
+@pytest.mark.asyncio
+async def test_ticktick_client_surfaces_error_after_retries_are_exhausted(monkeypatch: pytest.MonkeyPatch) -> None:
+    attempts = 0
+    sleep_delays: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleep_delays.append(delay)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(503, json={"detail": "still unavailable"})
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="https://developer.ticktick.com") as http_client:
+        client = TickTickClient(base_url="https://developer.ticktick.com", http_client=http_client)
+
+        with pytest.raises(httpx.HTTPStatusError):
+            await client.create_task(
+                access_token="token",
+                task=TickTickTaskCreate(
+                    title="最终仍会失败的任务",
+                    projectId="inbox",
+                ),
+            )
+
+    assert attempts > 1
+    assert sleep_delays

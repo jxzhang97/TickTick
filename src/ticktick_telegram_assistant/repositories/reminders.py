@@ -73,3 +73,24 @@ class ReminderRepository:
         if self._session is not None:
             self._session.add(reminder_event)
         return reminder_event
+
+    def reschedule_pending(
+        self,
+        reminder_event: ReminderEvent,
+        *,
+        scheduled_at: datetime,
+        payload_json: dict | None = None,
+    ) -> ReminderEvent:
+        reminder_event.status = "pending"
+        reminder_event.scheduled_at = scheduled_at
+        if payload_json is not None:
+            reminder_event.payload_json = payload_json
+        if self._session is not None:
+            self._session.add(reminder_event)
+        return reminder_event
+
+    def mark_status(self, reminder_event: ReminderEvent, *, status: str) -> ReminderEvent:
+        reminder_event.status = status
+        if self._session is not None:
+            self._session.add(reminder_event)
+        return reminder_event

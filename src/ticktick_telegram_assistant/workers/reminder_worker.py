@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta, timezone
+import logging
 import math
 from zoneinfo import ZoneInfo
 
+import httpx
 from sqlalchemy.orm import Session, sessionmaker
 
 from ticktick_telegram_assistant.db.models.reminder_event import ReminderEvent
@@ -17,10 +19,18 @@ from ticktick_telegram_assistant.services.message_renderer import MessageRendere
 from ticktick_telegram_assistant.services.today_brief_service import TodayBriefService
 
 
+logger = logging.getLogger(__name__)
+
+
 class ReminderWorker:
     _MORNING_BRIEF_CATCHUP = timedelta(hours=4)
     _EVENING_REVIEW_CATCHUP = timedelta(hours=3)
     _WEEKLY_MEMO_CLEANUP_CATCHUP = timedelta(hours=10)
+    _PENDING_RETRY_BASE = timedelta(minutes=1)
+    _PENDING_RETRY_MAX = timedelta(minutes=15)
+    _MORNING_BRIEF_PENDING_TTL = timedelta(hours=10)
+    _EVENING_REVIEW_PENDING_TTL = timedelta(hours=8)
+    _PRESTART_MISSED_GRACE = timedelta(minutes=10)
 
     def __init__(
         self,
@@ -66,29 +76,67 @@ class ReminderWorker:
         timezone_name = user.current_timezone or "America/Los_Angeles"
         local_now = now.astimezone(ZoneInfo(timezone_name))
         await self._send_due_pending_events(user=user, now=now)
-        tasks = await self._ticktick_client.list_tasks(access_token=user.ticktick_access_token, since=None)
-        task_lines = self._build_task_lines(tasks=tasks, timezone_name=timezone_name)
+        tasks, tasks_fetch_error = await self._try_list_tasks(user=user)
+        task_lines = self._build_task_lines(tasks=tasks or [], timezone_name=timezone_name)
 
         morning_schedule = self._resolve_morning_brief_schedule(local_now=local_now)
         if morning_schedule is not None and self._today_brief_service is not None:
-            text = await self._today_brief_service.build_today_brief_for_user(user=user, now=local_now, tasks=tasks)
-            if text:
-                await self._send_once(
-                    user=user,
-                    dedupe_key=f"morning_brief:{morning_schedule.date().isoformat()}",
-                    event_type="morning_brief",
-                    scheduled_at=morning_schedule,
-                    text=text,
-                    now=now,
-                )
+            dedupe_key = f"morning_brief:{morning_schedule.date().isoformat()}"
+            if tasks is None:
+                if self._is_retryable_ticktick_error(tasks_fetch_error):
+                    await self._queue_generated_pending_event(
+                        user=user,
+                        event_type="morning_brief",
+                        dedupe_key=dedupe_key,
+                        scheduled_at=morning_schedule,
+                        payload_json={
+                            "timezone_name": timezone_name,
+                            "attempt_count": 0,
+                            "expires_at": (morning_schedule + self._MORNING_BRIEF_PENDING_TTL).isoformat(),
+                        },
+                    )
+            else:
+                text = await self._today_brief_service.build_today_brief_for_user(user=user, now=local_now, tasks=tasks)
+                if text:
+                    await self._send_once(
+                        user=user,
+                        dedupe_key=dedupe_key,
+                        event_type="morning_brief",
+                        scheduled_at=morning_schedule,
+                        text=text,
+                        now=now,
+                    )
 
-        await self._send_prestart_reminders(user=user, local_now=local_now, tasks=tasks, timezone_name=timezone_name, now=now)
+        if tasks is not None:
+            await self._send_prestart_reminders(
+                user=user,
+                local_now=local_now,
+                tasks=tasks,
+                timezone_name=timezone_name,
+                now=now,
+            )
         await self._send_windowed_reminders(user=user, local_now=local_now, now=now)
         await self._send_weekly_memo_cleanup(user=user, local_now=local_now, now=now)
 
         evening_schedule = self._resolve_evening_review_schedule(local_now=local_now)
         if evening_schedule is not None:
             scheduled_at, review_date = evening_schedule
+            dedupe_key = f"evening_review:{review_date.isoformat()}"
+            if tasks is None:
+                if self._is_retryable_ticktick_error(tasks_fetch_error):
+                    await self._queue_generated_pending_event(
+                        user=user,
+                        event_type="evening_review",
+                        dedupe_key=dedupe_key,
+                        scheduled_at=scheduled_at,
+                        payload_json={
+                            "timezone_name": timezone_name,
+                            "review_date": review_date.isoformat(),
+                            "attempt_count": 0,
+                            "expires_at": (scheduled_at + self._EVENING_REVIEW_PENDING_TTL).isoformat(),
+                        },
+                    )
+                return
             candidates = self._build_evening_review_candidates(
                 review_date=review_date,
                 task_lines=task_lines,
@@ -99,13 +147,14 @@ class ReminderWorker:
             if text:
                 await self._send_once(
                     user=user,
-                    dedupe_key=f"evening_review:{review_date.isoformat()}",
+                    dedupe_key=dedupe_key,
                     event_type="evening_review",
                     scheduled_at=scheduled_at,
                     text=text,
                     payload_json={
                         "text": text,
                         "candidate_tasks": candidates,
+                        "review_date": review_date.isoformat(),
                     },
                     now=now,
                 )
@@ -126,10 +175,15 @@ class ReminderWorker:
             if anchor_at is None:
                 continue
             scheduled_at = anchor_at - timedelta(minutes=5)
-            if not (scheduled_at <= local_now < anchor_at):
+            is_on_time = scheduled_at <= local_now < anchor_at
+            is_catch_up = anchor_at <= local_now < anchor_at + self._PRESTART_MISSED_GRACE
+            if not (is_on_time or is_catch_up):
                 continue
             description = task.desc or task.content or None
-            text = f"还有 5 分钟：{self._renderer.render_weekday(anchor_at)} {anchor_at.strftime('%H:%M')} {task.title}"
+            if is_catch_up:
+                text = f"刚刚错过 5 分钟提醒，不过现在也该留意了：{self._renderer.render_weekday(anchor_at)} {anchor_at.strftime('%H:%M')} {task.title}"
+            else:
+                text = f"还有 5 分钟：{self._renderer.render_weekday(anchor_at)} {anchor_at.strftime('%H:%M')} {task.title}"
             if description:
                 text = f"{text}，{description}"
             await self._send_once(
@@ -204,12 +258,121 @@ class ReminderWorker:
             reminder_repo = ReminderRepository(session)
             pending_events = reminder_repo.list_due_pending_for_user(user_id=user.id, now=now)
             for event in pending_events:
-                text = (event.payload_json or {}).get("text")
+                try:
+                    text, payload_json = await self._build_pending_event_delivery(user=user, event=event)
+                except Exception as exc:
+                    if self._pending_event_expired(event=event, now=now):
+                        reminder_repo.mark_status(event, status="expired")
+                    else:
+                        pending_payload = dict(event.payload_json or {})
+                        attempts = int(pending_payload.get("attempt_count", 0))
+                        pending_payload["attempt_count"] = attempts + 1
+                        reminder_repo.reschedule_pending(
+                            event,
+                            scheduled_at=now + self._pending_retry_delay(attempts),
+                            payload_json=pending_payload,
+                        )
+                    logger.warning("pending reminder delivery failed for %s", event.dedupe_key, exc_info=exc)
+                    continue
                 if not text:
+                    reminder_repo.mark_status(event, status="expired")
                     continue
                 await self._telegram_client.send_message(chat_id=int(user.telegram_user_id), text=text)
+                event.payload_json = payload_json
                 reminder_repo.mark_sent(event, sent_at=now)
             session.commit()
+
+    async def _try_list_tasks(self, *, user: User) -> tuple[list[TickTickTask] | None, Exception | None]:
+        try:
+            tasks = await self._ticktick_client.list_tasks(access_token=user.ticktick_access_token, since=None)
+        except Exception as exc:
+            logger.warning("ticktick list_tasks failed for user %s", user.telegram_user_id, exc_info=exc)
+            return None, exc
+        return tasks, None
+
+    def _is_retryable_ticktick_error(self, error: Exception | None) -> bool:
+        if error is None:
+            return False
+        if isinstance(error, httpx.RequestError):
+            return True
+        if isinstance(error, httpx.HTTPStatusError):
+            return 500 <= error.response.status_code < 600
+        return False
+
+    async def _queue_generated_pending_event(
+        self,
+        *,
+        user: User,
+        event_type: str,
+        dedupe_key: str,
+        scheduled_at: datetime,
+        payload_json: dict,
+    ) -> None:
+        with self._session_factory() as session:
+            reminder_repo = ReminderRepository(session)
+            if reminder_repo.get_by_dedupe_key(dedupe_key) is not None:
+                return
+            reminder_repo.add(
+                ReminderEvent(
+                    user_id=user.id,
+                    event_type=event_type,
+                    scheduled_at=scheduled_at,
+                    status="pending",
+                    payload_json=payload_json,
+                    dedupe_key=dedupe_key,
+                )
+            )
+            session.commit()
+
+    async def _build_pending_event_delivery(
+        self,
+        *,
+        user: User,
+        event: ReminderEvent,
+    ) -> tuple[str | None, dict]:
+        payload_json = dict(event.payload_json or {})
+        text = payload_json.get("text")
+        if text:
+            return str(text), payload_json
+
+        timezone_name = payload_json.get("timezone_name") or user.current_timezone or "America/Los_Angeles"
+        if event.event_type == "morning_brief" and self._today_brief_service is not None:
+            local_now = event.scheduled_at.astimezone(ZoneInfo(timezone_name))
+            text = await self._today_brief_service.build_today_brief_for_user(user=user, now=local_now)
+            payload_json["text"] = text
+            return text, payload_json
+
+        if event.event_type == "evening_review":
+            tasks = await self._ticktick_client.list_tasks(access_token=user.ticktick_access_token, since=None)
+            task_lines = self._build_task_lines(tasks=tasks, timezone_name=timezone_name)
+            review_date_raw = payload_json.get("review_date")
+            review_date = date.fromisoformat(review_date_raw) if review_date_raw else event.scheduled_at.date()
+            text = self._build_evening_review(review_date=review_date, task_lines=task_lines)
+            payload_json["text"] = text
+            payload_json["candidate_tasks"] = self._build_evening_review_candidates(
+                review_date=review_date,
+                task_lines=task_lines,
+            )
+            return text, payload_json
+
+        return payload_json.get("text"), payload_json
+
+    def _pending_event_expired(self, *, event: ReminderEvent, now: datetime) -> bool:
+        payload_json = event.payload_json or {}
+        raw_expiry = payload_json.get("expires_at")
+        if not raw_expiry:
+            return False
+        try:
+            expires_at = datetime.fromisoformat(str(raw_expiry))
+        except ValueError:
+            return False
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=now.tzinfo)
+        return now >= expires_at
+
+    def _pending_retry_delay(self, attempts: int) -> timedelta:
+        delay_seconds = self._PENDING_RETRY_BASE.total_seconds() * (2**attempts)
+        return timedelta(seconds=min(delay_seconds, self._PENDING_RETRY_MAX.total_seconds()))
 
     async def _send_windowed_reminders(self, *, user: User, local_now: datetime, now: datetime) -> None:
         with self._session_factory() as session:
