@@ -13,12 +13,15 @@ from ticktick_telegram_assistant.integrations.ticktick_client import TickTickCli
 from ticktick_telegram_assistant.repositories.task_shadows import TaskShadowRepository
 from ticktick_telegram_assistant.services.briefing_service import BriefingService
 from ticktick_telegram_assistant.services.message_renderer import MessageRenderer
+from ticktick_telegram_assistant.services.ticktick_snapshot_service import TickTickSnapshotService
 
 
 @dataclass
 class TaskBriefSnapshot:
     current_time: datetime
     timezone_name: str
+    is_stale: bool
+    snapshot_synced_at: datetime | None
     today_timed_items: list[dict]
     today_date_only_items: list[dict]
     active_windowed_items: list[dict]
@@ -38,11 +41,16 @@ class TodayBriefService:
         ticktick_client: TickTickClient,
         briefing_service: BriefingService | None = None,
         renderer: MessageRenderer | None = None,
+        snapshot_service=None,
     ) -> None:
         self._session_factory = session_factory
         self._ticktick_client = ticktick_client
         self._briefing_service = briefing_service or BriefingService(renderer=renderer)
         self._renderer = renderer or MessageRenderer()
+        self._snapshot_service = snapshot_service or TickTickSnapshotService(
+            session_factory=session_factory,
+            ticktick_client=ticktick_client,
+        )
 
     async def build_today_brief(self, *, telegram_user_id: str, now: datetime | None = None) -> str:
         user = self._get_user(telegram_user_id=telegram_user_id)
@@ -64,12 +72,20 @@ class TodayBriefService:
         user: User | None,
         now: datetime | None = None,
         tasks: list[TickTickTask] | None = None,
+        snapshot_is_stale: bool = False,
+        snapshot_synced_at: datetime | None = None,
     ) -> str:
-        snapshot = await self.build_snapshot_for_user(user=user, now=now, tasks=tasks)
+        snapshot = await self.build_snapshot_for_user(
+            user=user,
+            now=now,
+            tasks=tasks,
+            snapshot_is_stale=snapshot_is_stale,
+            snapshot_synced_at=snapshot_synced_at,
+        )
         if snapshot is None:
             return "我现在还没拿到你的 TickTick 访问权限，所以还不能替你拉今天的安排。"
 
-        return self._briefing_service.render_morning_brief(
+        message = self._briefing_service.render_morning_brief(
             current_time=snapshot.current_time,
             today_timed_items=snapshot.today_timed_items,
             today_date_only_items=snapshot.today_date_only_items,
@@ -79,6 +95,14 @@ class TodayBriefService:
             upcoming_windowed_items=snapshot.upcoming_windowed_items,
             memo_items=snapshot.memo_items,
         )
+        if snapshot.is_stale:
+            stale_anchor = (
+                self._renderer.render_date_anchor(snapshot.snapshot_synced_at.astimezone(ZoneInfo(snapshot.timezone_name)))
+                if snapshot.snapshot_synced_at is not None
+                else "刚才"
+            )
+            return f"注：刚刚没拉到 TickTick 实时数据，我先用 {stale_anchor} 的本地快照帮你顶上，可能会有一点点旧。\n\n{message}"
+        return message
 
     async def build_snapshot_for_user(
         self,
@@ -86,6 +110,8 @@ class TodayBriefService:
         user: User | None,
         now: datetime | None = None,
         tasks: list[TickTickTask] | None = None,
+        snapshot_is_stale: bool = False,
+        snapshot_synced_at: datetime | None = None,
     ) -> TaskBriefSnapshot | None:
         if user is None or not user.ticktick_access_token:
             return None
@@ -98,8 +124,16 @@ class TodayBriefService:
             current_time = current_time.astimezone(ZoneInfo(timezone_name))
 
         fetched_tasks = tasks
+        is_stale = snapshot_is_stale
+        synced_at = snapshot_synced_at
         if fetched_tasks is None:
-            fetched_tasks = await self._ticktick_client.list_tasks(access_token=user.ticktick_access_token)
+            if self._snapshot_service is not None:
+                tasks_result = await self._snapshot_service.list_tasks_for_user(user=user, now=current_time)
+                fetched_tasks = tasks_result.items
+                is_stale = tasks_result.is_stale
+                synced_at = tasks_result.snapshot_synced_at
+            else:
+                fetched_tasks = await self._ticktick_client.list_tasks(access_token=user.ticktick_access_token)
         today = current_time.date()
         windowed_shadows, memo_shadows = self._load_shadow_groups(user_id=user.id)
         windowed_task_ids = {shadow.ticktick_task_id for shadow in windowed_shadows}
@@ -185,6 +219,8 @@ class TodayBriefService:
         return TaskBriefSnapshot(
             current_time=current_time,
             timezone_name=timezone_name,
+            is_stale=is_stale,
+            snapshot_synced_at=synced_at,
             today_timed_items=today_timed_items,
             today_date_only_items=today_date_only_items,
             active_windowed_items=active_windowed_items,

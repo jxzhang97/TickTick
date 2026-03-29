@@ -15,6 +15,7 @@ from ticktick_telegram_assistant.services.conversation_service import Conversati
 from ticktick_telegram_assistant.services.memory_service import MemoryService
 from ticktick_telegram_assistant.services.task_command_service import TaskCommandService
 from ticktick_telegram_assistant.services.task_query_service import TaskQueryService
+from ticktick_telegram_assistant.services.ticktick_snapshot_service import TickTickSnapshotService
 from ticktick_telegram_assistant.services.ticktick_oauth_service import TickTickOAuthService
 from ticktick_telegram_assistant.services.timezone_resolver import TimezoneResolver
 from ticktick_telegram_assistant.services.today_brief_service import TodayBriefService
@@ -42,9 +43,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.memory_service = MemoryService(session_factory=app.state.session_factory)
     app.state.timezone_resolver = TimezoneResolver()
+    app.state.ticktick_snapshot_service = TickTickSnapshotService(
+        session_factory=app.state.session_factory,
+        ticktick_client=app.state.ticktick_client,
+    )
     app.state.today_brief_service = TodayBriefService(
         session_factory=app.state.session_factory,
         ticktick_client=app.state.ticktick_client,
+        snapshot_service=app.state.ticktick_snapshot_service,
+    )
+    app.state.task_command_service = TaskCommandService(
+        session_factory=app.state.session_factory,
+        ticktick_client=app.state.ticktick_client,
+        snapshot_service=app.state.ticktick_snapshot_service,
     )
     app.state.task_query_service = TaskQueryService(
         session_factory=app.state.session_factory,
@@ -56,10 +67,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ticktick_oauth_service=app.state.ticktick_oauth_service,
         today_brief_service=app.state.today_brief_service,
         task_query_service=app.state.task_query_service,
-        task_command_service=TaskCommandService(
-            session_factory=app.state.session_factory,
-            ticktick_client=app.state.ticktick_client,
-        ),
+        task_command_service=app.state.task_command_service,
         session_factory=app.state.session_factory,
         timezone_resolver=app.state.timezone_resolver,
         memory_service=app.state.memory_service,

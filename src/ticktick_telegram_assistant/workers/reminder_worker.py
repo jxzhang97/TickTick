@@ -10,12 +10,15 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from ticktick_telegram_assistant.db.models.reminder_event import ReminderEvent
 from ticktick_telegram_assistant.db.models.user import User
+from ticktick_telegram_assistant.domain.schemas import PlannedAction
 from ticktick_telegram_assistant.integrations.ticktick_client import TickTickTask
 from ticktick_telegram_assistant.repositories.reminders import ReminderRepository
 from ticktick_telegram_assistant.repositories.task_shadows import TaskShadowRepository
 from ticktick_telegram_assistant.repositories.users import UserRepository
 from ticktick_telegram_assistant.services.briefing_service import BriefingService
 from ticktick_telegram_assistant.services.message_renderer import MessageRenderer
+from ticktick_telegram_assistant.services.task_command_service import TaskCommandService
+from ticktick_telegram_assistant.services.ticktick_snapshot_service import TickTickSnapshotService
 from ticktick_telegram_assistant.services.today_brief_service import TodayBriefService
 
 
@@ -41,22 +44,31 @@ class ReminderWorker:
         briefing_service: BriefingService | None = None,
         renderer: MessageRenderer | None = None,
         today_brief_service: TodayBriefService | None = None,
+        task_command_service: TaskCommandService | None = None,
+        snapshot_service: TickTickSnapshotService | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._ticktick_client = ticktick_client
         self._telegram_client = telegram_client
         self._briefing_service = briefing_service or BriefingService()
         self._renderer = renderer or MessageRenderer()
+        self._snapshot_service = snapshot_service or (
+            TickTickSnapshotService(session_factory=session_factory, ticktick_client=ticktick_client)
+            if session_factory is not None
+            else None
+        )
         self._today_brief_service = today_brief_service or (
             TodayBriefService(
                 session_factory=session_factory,
                 ticktick_client=ticktick_client,
                 briefing_service=self._briefing_service,
                 renderer=self._renderer,
+                snapshot_service=self._snapshot_service,
             )
             if session_factory is not None and ticktick_client is not None
             else None
         )
+        self._task_command_service = task_command_service
 
     async def run_once(self, *, now: datetime | None = None) -> None:
         if self._session_factory is None or self._ticktick_client is None or self._telegram_client is None:
@@ -76,7 +88,7 @@ class ReminderWorker:
         timezone_name = user.current_timezone or "America/Los_Angeles"
         local_now = now.astimezone(ZoneInfo(timezone_name))
         await self._send_due_pending_events(user=user, now=now)
-        tasks, tasks_fetch_error = await self._try_list_tasks(user=user)
+        tasks, tasks_fetch_error, tasks_are_stale, snapshot_synced_at = await self._try_list_tasks(user=user, now=now)
         task_lines = self._build_task_lines(tasks=tasks or [], timezone_name=timezone_name)
 
         morning_schedule = self._resolve_morning_brief_schedule(local_now=local_now)
@@ -96,7 +108,13 @@ class ReminderWorker:
                         },
                     )
             else:
-                text = await self._today_brief_service.build_today_brief_for_user(user=user, now=local_now, tasks=tasks)
+                text = await self._today_brief_service.build_today_brief_for_user(
+                    user=user,
+                    now=local_now,
+                    tasks=tasks,
+                    snapshot_is_stale=tasks_are_stale,
+                    snapshot_synced_at=snapshot_synced_at,
+                )
                 if text:
                     await self._send_once(
                         user=user,
@@ -282,13 +300,22 @@ class ReminderWorker:
                 reminder_repo.mark_sent(event, sent_at=now)
             session.commit()
 
-    async def _try_list_tasks(self, *, user: User) -> tuple[list[TickTickTask] | None, Exception | None]:
+    async def _try_list_tasks(
+        self,
+        *,
+        user: User,
+        now: datetime,
+    ) -> tuple[list[TickTickTask] | None, Exception | None, bool, datetime | None]:
         try:
+            if self._snapshot_service is not None:
+                result = await self._snapshot_service.list_tasks_for_user(user=user, now=now)
+                tasks = result.items
+                return tasks, None, result.is_stale, result.snapshot_synced_at
             tasks = await self._ticktick_client.list_tasks(access_token=user.ticktick_access_token, since=None)
         except Exception as exc:
             logger.warning("ticktick list_tasks failed for user %s", user.telegram_user_id, exc_info=exc)
-            return None, exc
-        return tasks, None
+            return None, exc, False, None
+        return tasks, None, False, None
 
     def _is_retryable_ticktick_error(self, error: Exception | None) -> bool:
         if error is None:
@@ -354,6 +381,19 @@ class ReminderWorker:
                 task_lines=task_lines,
             )
             return text, payload_json
+
+        if event.event_type == "ticktick_write_retry" and self._task_command_service is not None:
+            action_payload = payload_json.get("action") or {}
+            source_text = payload_json.get("source_text")
+            action = PlannedAction.model_validate(action_payload)
+            reply_text = await self._task_command_service.execute_action(
+                telegram_user_id=user.telegram_user_id,
+                action=action,
+                source_text=source_text if isinstance(source_text, str) else None,
+                allow_retry_queue=False,
+            )
+            payload_json["text"] = reply_text
+            return f"刚才卡住的那条我现在已经补上了：\n{reply_text}", payload_json
 
         return payload_json.get("text"), payload_json
 

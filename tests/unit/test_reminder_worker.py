@@ -11,6 +11,7 @@ from ticktick_telegram_assistant.db.base import Base
 from ticktick_telegram_assistant.db.models.reminder_event import ReminderEvent
 from ticktick_telegram_assistant.db.models.task_shadow import TaskShadow
 from ticktick_telegram_assistant.db.models.user import User
+from ticktick_telegram_assistant.domain.schemas import PlannedAction
 from ticktick_telegram_assistant.integrations.ticktick_client import TickTickTask
 
 
@@ -41,6 +42,33 @@ class FakeTickTickClient:
         if len(self.calls) in self.fail_on_call_numbers:
             raise self.error
         return list(self.tasks)
+
+
+class FakeTaskCommandService:
+    def __init__(self, reply_text: str = "ok") -> None:
+        self.reply_text = reply_text
+        self.calls: list[dict] = []
+
+    async def execute_action(
+        self,
+        *,
+        telegram_user_id: str,
+        action,
+        now=None,
+        execution_cache=None,
+        source_text: str | None = None,
+        retry_dedupe_key: str | None = None,
+        allow_retry_queue: bool = True,
+    ) -> str:
+        self.calls.append(
+            {
+                "telegram_user_id": telegram_user_id,
+                "action": action,
+                "allow_retry_queue": allow_retry_queue,
+                "source_text": source_text,
+            }
+        )
+        return self.reply_text
 
 
 def make_session_factory() -> sessionmaker[Session]:
@@ -275,6 +303,58 @@ async def test_reminder_worker_queues_and_backfills_morning_brief_when_ticktick_
         assert reminder.event_type == "morning_brief"
         assert reminder.status == "sent"
         assert reminder.sent_at is not None
+
+
+@pytest.mark.asyncio
+async def test_reminder_worker_replays_pending_ticktick_write_retry() -> None:
+    from ticktick_telegram_assistant.workers.reminder_worker import ReminderWorker
+
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        user = User(
+            telegram_user_id="99",
+            display_name="Jiaxin",
+            current_timezone="America/Los_Angeles",
+            ticktick_access_token="access-token",
+        )
+        session.add(user)
+        session.flush()
+        session.add(
+            ReminderEvent(
+                user_id=user.id,
+                event_type="ticktick_write_retry",
+                scheduled_at=datetime.fromisoformat("2026-03-29T21:00:00-07:00"),
+                status="pending",
+                dedupe_key="retry:99:msg-1:complete",
+                payload_json={
+                    "action": PlannedAction(
+                        action_type="complete_task",
+                        payload={"title": "和家里打电话"},
+                    ).model_dump(mode="json"),
+                    "source_text": "和家里打电话已完成",
+                },
+            )
+        )
+        session.commit()
+
+    telegram_client = FakeTelegramClient()
+    task_command_service = FakeTaskCommandService("好，这条我帮你勾完成了：和家里打电话")
+    worker = ReminderWorker(
+        session_factory=session_factory,
+        ticktick_client=FakeTickTickClient([]),
+        telegram_client=telegram_client,
+        task_command_service=task_command_service,
+    )
+
+    await worker.run_once(now=datetime.fromisoformat("2026-03-29T21:05:00-07:00"))
+
+    assert len(task_command_service.calls) == 1
+    assert task_command_service.calls[0]["allow_retry_queue"] is False
+    assert len(telegram_client.sent_messages) == 1
+    assert "已经补上了" in telegram_client.sent_messages[0]["text"]
+    with session_factory() as session:
+        reminder = session.query(ReminderEvent).one()
+        assert reminder.status == "sent"
 
 
 @pytest.mark.asyncio

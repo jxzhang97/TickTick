@@ -48,30 +48,42 @@ class TaskQueryService:
             return "我现在还没拿到你的 TickTick 访问权限，所以还不能替你拉这些安排。"
 
         if scope == "tomorrow":
-            return self._render_custom_range(
+            reply = self._render_custom_range(
                 snapshot=snapshot,
                 query=query,
                 header="我把明天要留意的事整理好了。",
                 range_start=self._start_of_day(snapshot.current_time + timedelta(days=1)),
                 range_end=self._end_of_day(snapshot.current_time + timedelta(days=1)),
             )
+            return self._prepend_stale_note(snapshot=snapshot, reply=reply)
         if scope == "overdue":
-            return self._render_overdue(snapshot)
+            return self._prepend_stale_note(snapshot=snapshot, reply=self._render_overdue(snapshot))
         if scope == "this_week":
-            return self._render_this_week(snapshot)
+            return self._prepend_stale_note(snapshot=snapshot, reply=self._render_this_week(snapshot))
         if scope == "custom_range":
             range_start = query.range_start or self._start_of_day(snapshot.current_time)
             range_end = query.range_end or self._end_of_day(snapshot.current_time + timedelta(days=7))
-            return self._render_custom_range(
+            reply = self._render_custom_range(
                 snapshot=snapshot,
                 query=query,
                 header=f"我按 {self._renderer.render_date_anchor(range_start)} 到 {self._renderer.render_date_anchor(range_end)} 帮你捋了一遍。",
                 range_start=range_start,
                 range_end=range_end,
             )
+            return self._prepend_stale_note(snapshot=snapshot, reply=reply)
         if scope == "upcoming":
-            return self._render_upcoming(snapshot)
-        return self._render_recent(snapshot)
+            return self._prepend_stale_note(snapshot=snapshot, reply=self._render_upcoming(snapshot))
+        return self._prepend_stale_note(snapshot=snapshot, reply=self._render_recent(snapshot))
+
+    def _prepend_stale_note(self, *, snapshot: TaskBriefSnapshot, reply: str) -> str:
+        if not snapshot.is_stale:
+            return reply
+        stale_anchor = (
+            self._renderer.render_date_anchor(snapshot.snapshot_synced_at)
+            if snapshot.snapshot_synced_at is not None
+            else "刚才"
+        )
+        return f"注：刚刚没拉到 TickTick 实时数据，我先用 {stale_anchor} 的本地快照帮你顶上，可能会有一点点旧。\n\n{reply}"
 
     def _render_recent(self, snapshot: TaskBriefSnapshot) -> str:
         explicit_items = self._sorted_explicit_items(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
+import httpx
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -13,12 +14,15 @@ from ticktick_telegram_assistant.integrations.ticktick_client import TickTickTas
 
 
 class FakeTickTickClient:
-    def __init__(self, tasks: list[TickTickTask]) -> None:
+    def __init__(self, tasks: list[TickTickTask], *, error: Exception | None = None) -> None:
         self.tasks = tasks
+        self.error = error
         self.calls: list[dict] = []
 
     async def list_tasks(self, *, access_token: str, since=None) -> list[TickTickTask]:
         self.calls.append({"method": "list_tasks", "access_token": access_token, "since": since})
+        if self.error is not None:
+            raise self.error
         return self.tasks
 
 
@@ -38,6 +42,12 @@ def add_user(session: Session) -> User:
     session.add(user)
     session.flush()
     return user
+
+
+def make_ticktick_500_error(path: str = "/open/v1/project") -> httpx.HTTPStatusError:
+    request = httpx.Request("GET", f"https://api.ticktick.com{path}")
+    response = httpx.Response(500, request=request)
+    return httpx.HTTPStatusError("temporary failure", request=request, response=response)
 
 
 @pytest.mark.asyncio
@@ -250,3 +260,82 @@ async def test_build_today_brief_renders_memo_backlog_and_window_sections_even_w
     assert "整理实验记录" in message
     assert "这两周" in message
     assert "回导师邮件" in message
+
+
+@pytest.mark.asyncio
+async def test_build_today_brief_uses_cached_tasks_when_ticktick_temporarily_fails() -> None:
+    from ticktick_telegram_assistant.services.today_brief_service import TodayBriefService
+
+    tasks = [
+        TickTickTask(
+            id="future-ddl-1",
+            projectId="p1",
+            title="周三前交报告",
+            desc="别忘了结论",
+            dueDate="2026-04-01T18:00:00-0700",
+            status=0,
+        ),
+    ]
+
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        add_user(session)
+        session.commit()
+
+    client = FakeTickTickClient(tasks)
+    service = TodayBriefService(session_factory=session_factory, ticktick_client=client)
+
+    first_message = await service.build_today_brief(
+        telegram_user_id="99",
+        now=datetime.fromisoformat("2026-03-29T08:00:00-07:00"),
+    )
+    assert "周三前交报告" in first_message
+
+    client.error = make_ticktick_500_error()
+    second_message = await service.build_today_brief(
+        telegram_user_id="99",
+        now=datetime.fromisoformat("2026-03-29T08:05:00-07:00"),
+    )
+    assert "周三前交报告" in second_message
+    assert "本地快照" in second_message
+
+
+@pytest.mark.asyncio
+async def test_build_today_brief_uses_cached_snapshot_when_ticktick_temporarily_fails() -> None:
+    from ticktick_telegram_assistant.services.ticktick_snapshot_service import TickTickSnapshotService
+    from ticktick_telegram_assistant.services.today_brief_service import TodayBriefService
+
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        user = add_user(session)
+        session.commit()
+
+    cached_tasks = [
+        TickTickTask(
+            id="cached-1",
+            projectId="p1",
+            title="缓存里的今天任务",
+            dueDate="2026-03-29T14:00:00-0700",
+            status=0,
+        )
+    ]
+    snapshot_service = TickTickSnapshotService(session_factory=session_factory)
+    snapshot_service.save_tasks(
+        user_id=user.id,
+        tasks=cached_tasks,
+        fetched_at=datetime.fromisoformat("2026-03-29T07:50:00-07:00"),
+    )
+
+    service = TodayBriefService(
+        session_factory=session_factory,
+        ticktick_client=FakeTickTickClient([], error=make_ticktick_500_error()),
+        snapshot_service=snapshot_service,
+    )
+
+    message = await service.build_today_brief(
+        telegram_user_id="99",
+        now=datetime.fromisoformat("2026-03-29T08:00:00-07:00"),
+    )
+
+    assert "缓存里的今天任务" in message
+    assert "本地快照" in message

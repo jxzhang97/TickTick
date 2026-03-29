@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import hashlib
 import re
 from zoneinfo import ZoneInfo
 
@@ -560,6 +561,8 @@ class ConversationService:
             telegram_user_id=telegram_user_id,
             action=action,
             execution_cache=execution_cache,
+            source_text=update.message.text,
+            retry_dedupe_key=self._build_task_retry_dedupe_key(update=update),
         )
         self._store_active_task_context(telegram_user_id=telegram_user_id, action=action)
         if trace is not None:
@@ -817,6 +820,12 @@ class ConversationService:
             return None
         cleaned = cleaned.strip("“”\"'` ")
         return cleaned or None
+
+    def _build_task_retry_dedupe_key(self, *, update: TelegramUpdate) -> str | None:
+        if update.message is None or update.message.text is None:
+            return None
+        fingerprint = hashlib.sha1(update.message.text.encode("utf-8")).hexdigest()[:12]
+        return f"ticktick_write_retry:{update.message.chat.id}:{update.message.message_id}:{fingerprint}"
 
     def _parse_rule_based_time(self, *, raw_time: str | None, current_timezone: str):
         if raw_time is None:

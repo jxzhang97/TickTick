@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from datetime import datetime
 
+import httpx
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from ticktick_telegram_assistant.db.base import Base
+from ticktick_telegram_assistant.db.models.reminder_event import ReminderEvent
 from ticktick_telegram_assistant.db.models.task_shadow import TaskShadow
 from ticktick_telegram_assistant.db.models.user import User
 from ticktick_telegram_assistant.domain.schemas import PlannedAction
@@ -20,9 +22,12 @@ class FakeTickTickClient:
     def __init__(self) -> None:
         self.calls: list[dict] = []
         self.tasks: list[TickTickTask] = []
+        self.fail_on_methods: dict[str, Exception] = {}
 
     async def list_projects(self, *, access_token: str) -> list[TickTickProject]:
         self.calls.append({"method": "list_projects", "access_token": access_token})
+        if "list_projects" in self.fail_on_methods:
+            raise self.fail_on_methods["list_projects"]
         return [
             TickTickProject(id="telegram-inbox", name="Telegram Inbox", kind="TASK"),
             TickTickProject(id="fun", name="fun", kind="TASK"),
@@ -31,6 +36,8 @@ class FakeTickTickClient:
     async def create_task(self, *, access_token: str, task) -> TickTickTask:
         payload = task.model_dump(exclude_none=True)
         self.calls.append({"method": "create_task", "access_token": access_token, "task": payload})
+        if "create_task" in self.fail_on_methods:
+            raise self.fail_on_methods["create_task"]
         return TickTickTask(
             id="task-1",
             projectId=payload["projectId"],
@@ -42,6 +49,8 @@ class FakeTickTickClient:
 
     async def list_tasks(self, *, access_token: str, since=None) -> list[TickTickTask]:
         self.calls.append({"method": "list_tasks", "access_token": access_token, "since": since})
+        if "list_tasks" in self.fail_on_methods:
+            raise self.fail_on_methods["list_tasks"]
         return list(self.tasks)
 
     async def complete_task(self, *, access_token: str, project_id: str, task_id: str) -> None:
@@ -53,6 +62,8 @@ class FakeTickTickClient:
                 "task_id": task_id,
             }
         )
+        if "complete_task" in self.fail_on_methods:
+            raise self.fail_on_methods["complete_task"]
 
     async def update_task(self, *, access_token: str, task_id: str, patch) -> TickTickTask:
         payload = patch.model_dump(exclude_none=True)
@@ -64,6 +75,8 @@ class FakeTickTickClient:
                 "patch": payload,
             }
         )
+        if "update_task" in self.fail_on_methods:
+            raise self.fail_on_methods["update_task"]
         return TickTickTask(
             id=task_id,
             projectId=payload["projectId"],
@@ -78,6 +91,12 @@ def make_session_factory() -> sessionmaker[Session]:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     return sessionmaker(bind=engine, class_=Session, expire_on_commit=False)
+
+
+def make_ticktick_500_error(path: str = "/open/v1/project") -> httpx.HTTPStatusError:
+    request = httpx.Request("GET", f"https://api.ticktick.com{path}")
+    response = httpx.Response(500, request=request)
+    return httpx.HTTPStatusError("temporary failure", request=request, response=response)
 
 
 @pytest.mark.asyncio
@@ -219,6 +238,50 @@ async def test_execute_action_reuses_cached_tasks_across_batch_updates() -> None
             },
         },
     ]
+
+
+@pytest.mark.asyncio
+async def test_execute_action_queues_retryable_write_for_later_replay() -> None:
+    from ticktick_telegram_assistant.services.task_command_service import TaskCommandService
+
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        session.add(
+            User(
+                telegram_user_id="99",
+                display_name="Jiaxin",
+                current_timezone="America/Los_Angeles",
+                ticktick_access_token="access-token",
+            )
+        )
+        session.commit()
+
+    client = FakeTickTickClient()
+    client.tasks = [
+        TickTickTask(id="task-1", projectId="telegram-inbox", title="和家里打电话", status=0),
+    ]
+    client.fail_on_methods["complete_task"] = make_ticktick_500_error(
+        "/open/v1/project/telegram-inbox/task/task-1/complete"
+    )
+    service = TaskCommandService(session_factory=session_factory, ticktick_client=client)
+
+    reply = await service.execute_action(
+        telegram_user_id="99",
+        action=PlannedAction(action_type="complete_task", payload={"title": "和家里打电话"}),
+        source_text="和家里打电话已完成",
+        retry_dedupe_key="retry:99:msg-1:complete",
+    )
+
+    assert "排队" in reply
+    with session_factory() as session:
+        reminders = session.query(ReminderEvent).all()
+        assert len(reminders) == 1
+        reminder = reminders[0]
+        assert reminder.event_type == "ticktick_write_retry"
+        assert reminder.status == "pending"
+        assert reminder.dedupe_key == "retry:99:msg-1:complete"
+        assert reminder.payload_json["action"]["action_type"] == "complete_task"
+        assert reminder.payload_json["source_text"] == "和家里打电话已完成"
 
 
 @pytest.mark.asyncio

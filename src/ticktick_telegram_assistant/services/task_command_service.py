@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+import hashlib
 import re
 from typing import Any, Optional, Union
 
+import httpx
 from sqlalchemy.orm import Session, sessionmaker
 
+from ticktick_telegram_assistant.db.models.reminder_event import ReminderEvent
 from ticktick_telegram_assistant.db.models.task_shadow import TaskShadow
 from ticktick_telegram_assistant.domain.schemas import PlannedAction
 from ticktick_telegram_assistant.integrations.ticktick_client import (
@@ -16,9 +19,11 @@ from ticktick_telegram_assistant.integrations.ticktick_client import (
     TickTickTaskCreate,
     TickTickTaskPatch,
 )
+from ticktick_telegram_assistant.repositories.reminders import ReminderRepository
 from ticktick_telegram_assistant.repositories.task_shadows import TaskShadowRepository
 from ticktick_telegram_assistant.repositories.users import UserRepository
 from ticktick_telegram_assistant.services.message_renderer import MessageRenderer
+from ticktick_telegram_assistant.services.ticktick_snapshot_service import TickTickSnapshotService
 
 
 @dataclass
@@ -35,10 +40,15 @@ class TaskCommandService:
         session_factory: sessionmaker[Session],
         ticktick_client,
         message_renderer: Optional[MessageRenderer] = None,
+        snapshot_service: TickTickSnapshotService | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._ticktick_client = ticktick_client
         self._message_renderer = message_renderer or MessageRenderer()
+        self._snapshot_service = snapshot_service or TickTickSnapshotService(
+            session_factory=session_factory,
+            ticktick_client=ticktick_client,
+        )
 
     async def execute_action(
         self,
@@ -47,26 +57,43 @@ class TaskCommandService:
         action: PlannedAction,
         now: Optional[datetime] = None,
         execution_cache: TaskCommandExecutionCache | None = None,
+        source_text: str | None = None,
+        retry_dedupe_key: str | None = None,
+        allow_retry_queue: bool = True,
     ) -> str:
-        if action.action_type == "create_task":
-            return await self._create_task(
+        try:
+            if action.action_type == "create_task":
+                return await self._create_task(
+                    telegram_user_id=telegram_user_id,
+                    action=action,
+                    execution_cache=execution_cache,
+                )
+            if action.action_type == "complete_task":
+                return await self._complete_task(
+                    telegram_user_id=telegram_user_id,
+                    action=action,
+                    execution_cache=execution_cache,
+                )
+            if action.action_type == "update_task":
+                return await self._update_task(
+                    telegram_user_id=telegram_user_id,
+                    action=action,
+                    execution_cache=execution_cache,
+                )
+            return "这一步我还没稳定接好，所以先不冒险替你写入。"
+        except Exception as exc:
+            if not allow_retry_queue or not self._is_retryable_ticktick_error(exc):
+                raise
+            queued = self._queue_retryable_action(
                 telegram_user_id=telegram_user_id,
                 action=action,
-                execution_cache=execution_cache,
+                source_text=source_text,
+                dedupe_key=retry_dedupe_key,
+                now=now,
             )
-        if action.action_type == "complete_task":
-            return await self._complete_task(
-                telegram_user_id=telegram_user_id,
-                action=action,
-                execution_cache=execution_cache,
-            )
-        if action.action_type == "update_task":
-            return await self._update_task(
-                telegram_user_id=telegram_user_id,
-                action=action,
-                execution_cache=execution_cache,
-            )
-        return "这一步我还没稳定接好，所以先不冒险替你写入。"
+            if not queued:
+                raise
+            return self._build_retry_queued_reply(action=action)
 
     async def _create_task(
         self,
@@ -84,11 +111,10 @@ class TaskCommandService:
             if user is None or not user.ticktick_access_token:
                 return "我这边还没连上你的 TickTick，所以现在还不能替你创建任务。"
             user_id = user.id
-            access_token = user.ticktick_access_token
             timezone_name = user.current_timezone
 
         projects = await self._load_projects(
-            access_token=access_token,
+            user=user,
             execution_cache=execution_cache,
         )
         project = self._select_project(projects=projects, requested_name=action.payload.get("list_name"))
@@ -133,9 +159,10 @@ class TaskCommandService:
             items=checklist_items,
             tags=tags or None,
         )
-        created = await self._ticktick_client.create_task(access_token=access_token, task=create_payload)
+        created = await self._ticktick_client.create_task(access_token=user.ticktick_access_token, task=create_payload)
         action.target_task_id = created.id
         self._remember_created_task(execution_cache=execution_cache, task=created)
+        self._persist_execution_cache_snapshots(user_id=user_id, execution_cache=execution_cache)
 
         with self._session_factory() as session:
             TaskShadowRepository(session).add(
@@ -248,10 +275,10 @@ class TaskCommandService:
             user = UserRepository(session).get_by_telegram_user_id(telegram_user_id)
             if user is None or not user.ticktick_access_token:
                 return "我这边还没连上你的 TickTick，所以现在还不能替你勾完成。"
-            access_token = user.ticktick_access_token
+            user_id = user.id
 
         tasks = await self._load_tasks(
-            access_token=access_token,
+            user=user,
             execution_cache=execution_cache,
         )
         match_or_reply = self._resolve_open_task(
@@ -264,12 +291,13 @@ class TaskCommandService:
             return match_or_reply
 
         await self._ticktick_client.complete_task(
-            access_token=access_token,
+            access_token=user.ticktick_access_token,
             project_id=match_or_reply.projectId,
             task_id=match_or_reply.id,
         )
         action.target_task_id = match_or_reply.id
         self._remember_completed_task(execution_cache=execution_cache, task_id=match_or_reply.id)
+        self._persist_execution_cache_snapshots(user_id=user_id, execution_cache=execution_cache)
         return f"好，这条我帮你勾完成了：{match_or_reply.title}"
 
     async def _update_task(
@@ -287,11 +315,10 @@ class TaskCommandService:
             if user is None or not user.ticktick_access_token:
                 return "我这边还没连上你的 TickTick，所以现在还不能替你改任务。"
             user_id = user.id
-            access_token = user.ticktick_access_token
             timezone_name = user.current_timezone
 
         tasks = await self._load_tasks(
-            access_token=access_token,
+            user=user,
             execution_cache=execution_cache,
         )
         match_or_reply = self._resolve_open_task(
@@ -309,7 +336,7 @@ class TaskCommandService:
         target_list_name: Optional[str] = None
         if requested_list_name:
             projects = await self._load_projects(
-                access_token=access_token,
+                user=user,
                 execution_cache=execution_cache,
             )
             target_project = self._select_project(projects=projects, requested_name=requested_list_name)
@@ -452,7 +479,7 @@ class TaskCommandService:
 
         patch = TickTickTaskPatch(**patch_kwargs)
         await self._ticktick_client.update_task(
-            access_token=access_token,
+            access_token=user.ticktick_access_token,
             task_id=target_task.id,
             patch=patch,
         )
@@ -463,6 +490,7 @@ class TaskCommandService:
             patch=patch,
             moved_project_id=target_project_id if target_project_id != target_task.projectId else None,
         )
+        self._persist_execution_cache_snapshots(user_id=user_id, execution_cache=execution_cache)
 
         with self._session_factory() as session:
             shadow = (
@@ -572,12 +600,16 @@ class TaskCommandService:
     async def _load_projects(
         self,
         *,
-        access_token: str,
+        user,
         execution_cache: TaskCommandExecutionCache | None,
     ) -> list[TickTickProject]:
         if execution_cache is not None and execution_cache.projects is not None:
             return execution_cache.projects
-        projects = await self._ticktick_client.list_projects(access_token=access_token)
+        if self._snapshot_service is not None:
+            result = await self._snapshot_service.list_projects_for_user(user=user)
+            projects = result.items
+        else:
+            projects = await self._ticktick_client.list_projects(access_token=user.ticktick_access_token)
         if execution_cache is not None:
             execution_cache.projects = list(projects)
         return projects
@@ -585,15 +617,32 @@ class TaskCommandService:
     async def _load_tasks(
         self,
         *,
-        access_token: str,
+        user,
         execution_cache: TaskCommandExecutionCache | None,
     ) -> list[TickTickTask]:
         if execution_cache is not None and execution_cache.tasks is not None:
             return execution_cache.tasks
-        tasks = await self._ticktick_client.list_tasks(access_token=access_token, since=None)
+        if self._snapshot_service is not None:
+            result = await self._snapshot_service.list_tasks_for_user(user=user)
+            tasks = result.items
+        else:
+            tasks = await self._ticktick_client.list_tasks(access_token=user.ticktick_access_token, since=None)
         if execution_cache is not None:
             execution_cache.tasks = list(tasks)
         return tasks
+
+    def _persist_execution_cache_snapshots(
+        self,
+        *,
+        user_id: int,
+        execution_cache: TaskCommandExecutionCache | None,
+    ) -> None:
+        if self._snapshot_service is None or execution_cache is None:
+            return
+        if execution_cache.tasks is not None:
+            self._snapshot_service.save_tasks(user_id=user_id, tasks=execution_cache.tasks)
+        if execution_cache.projects is not None:
+            self._snapshot_service.save_projects(user_id=user_id, projects=execution_cache.projects)
 
     def _remember_created_task(
         self,
@@ -653,6 +702,76 @@ class TaskCommandService:
             if moved_project_id is not None:
                 task.projectId = moved_project_id
             return
+
+    def _queue_retryable_action(
+        self,
+        *,
+        telegram_user_id: str,
+        action: PlannedAction,
+        source_text: str | None,
+        dedupe_key: str | None,
+        now: datetime | None,
+    ) -> bool:
+        with self._session_factory() as session:
+            user = UserRepository(session).get_by_telegram_user_id(telegram_user_id)
+            if user is None:
+                return False
+            reminder_repo = ReminderRepository(session)
+            effective_dedupe_key = dedupe_key or self._build_retry_dedupe_key(
+                telegram_user_id=telegram_user_id,
+                action=action,
+                source_text=source_text,
+            )
+            if reminder_repo.get_by_dedupe_key(effective_dedupe_key) is not None:
+                return True
+            scheduled_at = now or datetime.now(timezone.utc)
+            if scheduled_at.tzinfo is None:
+                scheduled_at = scheduled_at.replace(tzinfo=timezone.utc)
+            reminder_repo.add(
+                ReminderEvent(
+                    user_id=user.id,
+                    ticktick_task_id=action.target_task_id,
+                    event_type="ticktick_write_retry",
+                    scheduled_at=scheduled_at,
+                    status="pending",
+                    dedupe_key=effective_dedupe_key,
+                    payload_json={
+                        "action": action.model_dump(mode="json"),
+                        "source_text": source_text,
+                        "attempt_count": 0,
+                        "expires_at": (scheduled_at + timedelta(hours=6)).isoformat(),
+                    },
+                )
+            )
+            session.commit()
+            return True
+
+    def _build_retry_dedupe_key(
+        self,
+        *,
+        telegram_user_id: str,
+        action: PlannedAction,
+        source_text: str | None,
+    ) -> str:
+        fingerprint = hashlib.sha1(
+            f"{action.action_type}|{action.target_task_id}|{action.payload}|{source_text or ''}".encode("utf-8")
+        ).hexdigest()[:12]
+        return f"ticktick_write_retry:{telegram_user_id}:{fingerprint}"
+
+    def _build_retry_queued_reply(self, *, action: PlannedAction) -> str:
+        title = (
+            self._clean_optional_text(action.payload.get("title"))
+            or self._clean_optional_text(action.payload.get("match_title"))
+            or "这条任务"
+        )
+        return f"TickTick 刚刚有点不稳定，我先把“{title}”排队了。等它恢复后我会自动再试，不用你重发。"
+
+    def _is_retryable_ticktick_error(self, error: Exception) -> bool:
+        if isinstance(error, httpx.RequestError):
+            return True
+        if isinstance(error, httpx.HTTPStatusError):
+            return 500 <= error.response.status_code < 600
+        return False
 
     def _resolve_open_task(
         self,

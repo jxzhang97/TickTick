@@ -119,10 +119,30 @@ class FakeTaskCommandService:
         self.created_task_id = created_task_id
         self.calls: list[dict] = []
 
-    async def execute_action(self, *, telegram_user_id: str, action, now=None, execution_cache=None) -> str:
+    async def execute_action(
+        self,
+        *,
+        telegram_user_id: str,
+        action,
+        now=None,
+        execution_cache=None,
+        source_text: str | None = None,
+        retry_dedupe_key: str | None = None,
+        allow_retry_queue: bool = True,
+    ) -> str:
         if action.action_type == "create_task" and self.created_task_id:
             action.target_task_id = self.created_task_id
-        self.calls.append({"telegram_user_id": telegram_user_id, "action": action, "now": now, "execution_cache": execution_cache})
+        self.calls.append(
+            {
+                "telegram_user_id": telegram_user_id,
+                "action": action,
+                "now": now,
+                "execution_cache": execution_cache,
+                "source_text": source_text,
+                "retry_dedupe_key": retry_dedupe_key,
+                "allow_retry_queue": allow_retry_queue,
+            }
+        )
         return self.reply_text
 
 
@@ -131,8 +151,28 @@ class SequencedTaskCommandService(FakeTaskCommandService):
         super().__init__(reply_text="")
         self._outcomes = list(outcomes)
 
-    async def execute_action(self, *, telegram_user_id: str, action, now=None, execution_cache=None) -> str:
-        self.calls.append({"telegram_user_id": telegram_user_id, "action": action, "now": now, "execution_cache": execution_cache})
+    async def execute_action(
+        self,
+        *,
+        telegram_user_id: str,
+        action,
+        now=None,
+        execution_cache=None,
+        source_text: str | None = None,
+        retry_dedupe_key: str | None = None,
+        allow_retry_queue: bool = True,
+    ) -> str:
+        self.calls.append(
+            {
+                "telegram_user_id": telegram_user_id,
+                "action": action,
+                "now": now,
+                "execution_cache": execution_cache,
+                "source_text": source_text,
+                "retry_dedupe_key": retry_dedupe_key,
+                "allow_retry_queue": allow_retry_queue,
+            }
+        )
         outcome = self._outcomes.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
@@ -2117,8 +2157,28 @@ async def test_handle_update_executes_evening_review_reply_from_saved_reminder_c
     )
 
     class SequencedTaskCommandService(FakeTaskCommandService):
-        async def execute_action(self, *, telegram_user_id: str, action, now=None, execution_cache=None) -> str:
-            self.calls.append({"telegram_user_id": telegram_user_id, "action": action, "now": now, "execution_cache": execution_cache})
+        async def execute_action(
+            self,
+            *,
+            telegram_user_id: str,
+            action,
+            now=None,
+            execution_cache=None,
+            source_text: str | None = None,
+            retry_dedupe_key: str | None = None,
+            allow_retry_queue: bool = True,
+        ) -> str:
+            self.calls.append(
+                {
+                    "telegram_user_id": telegram_user_id,
+                    "action": action,
+                    "now": now,
+                    "execution_cache": execution_cache,
+                    "source_text": source_text,
+                    "retry_dedupe_key": retry_dedupe_key,
+                    "allow_retry_queue": allow_retry_queue,
+                }
+            )
             mapping = {
                 "complete_task": f"done:{action.target_task_id}",
                 "update_task": f"updated:{action.target_task_id}",

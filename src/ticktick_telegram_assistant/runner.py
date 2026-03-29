@@ -17,6 +17,7 @@ from ticktick_telegram_assistant.services.conversation_service import Conversati
 from ticktick_telegram_assistant.services.memory_service import MemoryService
 from ticktick_telegram_assistant.services.task_command_service import TaskCommandService
 from ticktick_telegram_assistant.services.task_query_service import TaskQueryService
+from ticktick_telegram_assistant.services.ticktick_snapshot_service import TickTickSnapshotService
 from ticktick_telegram_assistant.services.ticktick_oauth_service import TickTickOAuthService
 from ticktick_telegram_assistant.services.timezone_resolver import TimezoneResolver
 from ticktick_telegram_assistant.services.today_brief_service import TodayBriefService
@@ -123,9 +124,19 @@ def build_local_runner(settings: Settings | None = None) -> LocalAssistantRunner
     )
     memory_service = MemoryService(session_factory=session_factory)
     planner = OpenAIPlanner(client=AsyncOpenAI(api_key=app_settings.openai_api_key) if app_settings.openai_api_key else None)
+    ticktick_snapshot_service = TickTickSnapshotService(
+        session_factory=session_factory,
+        ticktick_client=ticktick_client,
+    )
     today_brief_service = TodayBriefService(
         session_factory=session_factory,
         ticktick_client=ticktick_client,
+        snapshot_service=ticktick_snapshot_service,
+    )
+    task_command_service = TaskCommandService(
+        session_factory=session_factory,
+        ticktick_client=ticktick_client,
+        snapshot_service=ticktick_snapshot_service,
     )
     task_query_service = TaskQueryService(
         session_factory=session_factory,
@@ -137,10 +148,7 @@ def build_local_runner(settings: Settings | None = None) -> LocalAssistantRunner
         ticktick_oauth_service=ticktick_oauth_service,
         today_brief_service=today_brief_service,
         task_query_service=task_query_service,
-        task_command_service=TaskCommandService(
-            session_factory=session_factory,
-            ticktick_client=ticktick_client,
-        ),
+        task_command_service=task_command_service,
         session_factory=session_factory,
         timezone_resolver=TimezoneResolver(),
         memory_service=memory_service,
@@ -158,6 +166,8 @@ def build_local_runner(settings: Settings | None = None) -> LocalAssistantRunner
             session_factory=session_factory,
             ticktick_client=ticktick_client,
             telegram_client=telegram_client,
+            task_command_service=task_command_service,
+            snapshot_service=ticktick_snapshot_service,
         ),
         offset_state_path=app_settings.telegram_offset_state_path,
     )

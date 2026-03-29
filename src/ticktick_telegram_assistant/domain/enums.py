@@ -7,6 +7,7 @@ class MemoryType(str, Enum):
     TIME_EXPRESSION = "time_expression"
     DISAMBIGUATION_PATTERN = "disambiguation_pattern"
     STYLE_PREFERENCE = "style_preference"
+    TICKTICK_SNAPSHOT = "ticktick_snapshot"
 
 
 class PlannedActionType(str, Enum):
@@ -15,4 +16,3 @@ class PlannedActionType(str, Enum):
     UPDATE = "update"
     COMPLETE = "complete"
     REMINDER_CONTROL = "reminder_control"
-
