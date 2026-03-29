@@ -20,6 +20,7 @@ from ticktick_telegram_assistant.services.today_brief_service import TodayBriefS
 class ReminderWorker:
     _MORNING_BRIEF_CATCHUP = timedelta(hours=4)
     _EVENING_REVIEW_CATCHUP = timedelta(hours=3)
+    _WEEKLY_MEMO_CLEANUP_CATCHUP = timedelta(hours=10)
 
     def __init__(
         self,
@@ -234,7 +235,8 @@ class ReminderWorker:
                 )
 
     async def _send_weekly_memo_cleanup(self, *, user: User, local_now: datetime, now: datetime) -> None:
-        if local_now.weekday() != 6 or not self._is_trigger_time(local_now, hour=17, minute=0):
+        scheduled_at = self._resolve_weekly_memo_cleanup_schedule(local_now=local_now)
+        if scheduled_at is None:
             return
 
         with self._session_factory() as session:
@@ -264,13 +266,13 @@ class ReminderWorker:
             lines.append(f"还有 {len(memos) - len(memo_items)} 条我先没展开。")
         lines.append("你可以直接回我“把第1条变成任务”或者“先都留着”。")
         text = "\n".join(lines)
-        week = local_now.isocalendar()
+        week = scheduled_at.date().isocalendar()
         dedupe_key = f"memo_cleanup:{user.id}:{week.year}-W{week.week:02d}"
         await self._send_once(
             user=user,
             dedupe_key=dedupe_key,
             event_type="memo_cleanup",
-            scheduled_at=local_now.replace(hour=17, minute=0, second=0, microsecond=0),
+            scheduled_at=scheduled_at,
             text=text,
             now=now,
             payload_json={
@@ -356,6 +358,20 @@ class ReminderWorker:
         previous_scheduled = datetime.combine(previous_date, time(23, 30), tzinfo=local_now.tzinfo)
         if previous_scheduled <= local_now < previous_scheduled + self._EVENING_REVIEW_CATCHUP:
             return previous_scheduled, previous_date
+        return None
+
+    def _resolve_weekly_memo_cleanup_schedule(self, *, local_now: datetime) -> datetime | None:
+        same_day_scheduled = local_now.replace(hour=17, minute=0, second=0, microsecond=0)
+        if local_now.weekday() == 6 and same_day_scheduled <= local_now < same_day_scheduled + self._WEEKLY_MEMO_CLEANUP_CATCHUP:
+            return same_day_scheduled
+
+        if local_now.weekday() != 0 or local_now.timetz().replace(tzinfo=None) >= time(3, 0):
+            return None
+
+        previous_date = local_now.date() - timedelta(days=1)
+        previous_scheduled = datetime.combine(previous_date, time(17, 0), tzinfo=local_now.tzinfo)
+        if previous_scheduled <= local_now < previous_scheduled + self._WEEKLY_MEMO_CLEANUP_CATCHUP:
+            return previous_scheduled
         return None
 
     def _windowed_checkpoints(self, *, shadow, timezone_name: str) -> list[tuple[str, datetime | None]]:

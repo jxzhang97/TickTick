@@ -340,7 +340,7 @@ async def test_build_today_brief_renders_calendar_date_for_future_deadlines() ->
 
 
 @pytest.mark.asyncio
-async def test_build_today_brief_does_not_repeat_top_deadline_in_deadline_section() -> None:
+async def test_build_today_brief_keeps_deadline_detail_even_if_it_is_also_top_item() -> None:
     from ticktick_telegram_assistant.services.today_brief_service import TodayBriefService
 
     class SingleDeadlineClient(FakeTickTickClient):
@@ -382,4 +382,5 @@ async def test_build_today_brief_does_not_repeat_top_deadline_in_deadline_sectio
     top_section = message.split("今天最重要的几件：", 1)[1].split("今天有明确时间的安排：", 1)[0]
     ddl_section = message.split("未来 7 天的 ddl：", 1)[1].split("这几天要推进的时间窗口任务：", 1)[0]
     assert "周三前交报告" in top_section
-    assert "重点都在上面了。" in ddl_section
+    assert "04/01 周三" in ddl_section
+    assert "周三前交报告" in ddl_section

@@ -570,3 +570,42 @@ async def test_reminder_worker_sends_weekly_memo_cleanup_for_memo_shadows() -> N
             {"task_id": "memo-2", "title": "回邮件", "description": "下班后"},
             {"task_id": "memo-1", "title": "整理发票", "description": "周末"},
         ]
+
+
+@pytest.mark.asyncio
+async def test_reminder_worker_backfills_weekly_memo_cleanup_after_missed_trigger() -> None:
+    from ticktick_telegram_assistant.workers.reminder_worker import ReminderWorker
+
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        user = User(
+            telegram_user_id="99",
+            display_name="Jiaxin",
+            current_timezone="America/Los_Angeles",
+            ticktick_access_token="access-token",
+        )
+        session.add(user)
+        session.flush()
+        session.add(
+            TaskShadow(
+                user_id=user.id,
+                ticktick_task_id="memo-1",
+                semantic_type="memo",
+                normalized_title="整理发票",
+                raw_nl_time="周末",
+            )
+        )
+        session.commit()
+
+    ticktick_client = FakeTickTickClient([])
+    telegram_client = FakeTelegramClient()
+    worker = ReminderWorker(
+        session_factory=session_factory,
+        ticktick_client=ticktick_client,
+        telegram_client=telegram_client,
+    )
+
+    await worker.run_once(now=datetime.fromisoformat("2026-03-29T20:15:00-07:00"))
+
+    assert len(telegram_client.sent_messages) == 1
+    assert "周末收尾一下" in telegram_client.sent_messages[0]["text"]
