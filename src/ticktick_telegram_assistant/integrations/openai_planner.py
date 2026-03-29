@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import json
 from textwrap import dedent
-from typing import Optional
+from typing import Any, Optional
 
-from openai import AsyncOpenAI
 from pydantic import ValidationError
 
 from ticktick_telegram_assistant.domain.schemas import ConversationContext, PlannedConversation
+
+try:
+    from openai import AsyncOpenAI
+except ImportError:  # pragma: no cover - exercised implicitly in test environments without openai
+    AsyncOpenAI = Any  # type: ignore[assignment]
 
 
 class OpenAIPlanner:
@@ -27,7 +31,7 @@ class OpenAIPlanner:
         except Exception:
             return PlannedConversation()
         try:
-            return PlannedConversation.model_validate_json(self._extract_json(response.output_text))
+            return self._parse_planned_conversation(self._extract_json(response.output_text))
         except ValidationError:
             return PlannedConversation()
 
@@ -40,6 +44,30 @@ class OpenAIPlanner:
 
             输出 schema:
             {{
+              "intent_type": "query|reminder_control|clarification|task_write",
+              "query": {{
+                "query_kind": "today_brief|task_lookup|schedule_query|other",
+                "query_text": "用户原始查询",
+                "time_scope": "today|tomorrow|this_week|custom"
+              }},
+              "reminder_control": {{
+                "control_type": "snooze|stop|resume|reschedule",
+                "delay_minutes": 60,
+                "scheduled_at": "可选 ISO 8601",
+                "target_title": "可选",
+                "scope": "telegram_reminder"
+              }},
+              "clarification": {{
+                "question": "需要用户确认的问题",
+                "options": ["选项1", "选项2"],
+                "reason": "为什么要确认"
+              }},
+              "task_write": {{
+                "write_type": "create|update|complete",
+                "target_title": "目标任务标题",
+                "target_task_id": "可选任务 ID",
+                "summary": "一句话总结"
+              }},
               "actions": [
                 {{
                   "action_type": "create_task|complete_task|update_task",
@@ -70,12 +98,14 @@ class OpenAIPlanner:
             }}
 
             当前只允许这些策略：
-            1. 用户明确要新增/记录/提醒一条任务时，用 create_task。
-            2. 用户明确说某条任务“做完了/完成了/勾掉”，并且文本里带了可定位的标题时，用 complete_task，payload 至少填 title。
-            3. 用户明确说要改已有任务的时间、说明、标题或 list，并且文本里带了可定位的标题时，用 update_task；原任务标题放进 match_title，新的标题才放进 title。
-            4. 用户说的是今天安排、日程查询，不要输出 create_task、complete_task 或 update_task。
-            5. 用户在改已有任务、完成已有任务但指代不清、或其他高风险写操作时，actions 置空，requires_confirmation 设为 true，并给一句简短中文确认。
-            6. 当用户提到重复、优先级、标签、清单/子任务时，把这些信息放进 payload；不要丢字段。
+            1. 用户明确要新增/记录/提醒一条任务时，用 task_write=create，并保持 create_task action 作为兼容输出。
+            2. 用户明确说某条任务“做完了/完成了/勾掉”，并且文本里带了可定位的标题时，用 task_write=complete，并保持 complete_task action。
+            3. 用户明确说要改已有任务的时间、说明、标题或 list，并且文本里带了可定位的标题时，用 task_write=update，并保持 update_task action；原任务标题放进 match_title，新的标题才放进 title。
+            4. 用户说的是今天安排、日程查询、today brief 之类查询时，用 intent_type=query，填 query，actions 置空。
+            5. 用户说的是只调整 Telegram 侧提醒、稍后再提醒、暂停提醒、恢复提醒时，用 intent_type=reminder_control，填 reminder_control，actions 置空。
+            6. 用户需要先确认怎么做时，用 intent_type=clarification，填 clarification，requires_confirmation 设为 true，actions 置空。
+            7. 用户在改已有任务、完成已有任务但指代不清、或其他高风险写操作时，actions 置空，requires_confirmation 设为 true，并给一句简短中文确认。
+            8. 当用户提到重复、优先级、标签、清单/子任务时，把这些信息放进 payload；不要丢字段。
 
             时间规则：
             - 明确日期+时刻 => semantic_type=explicit_time，并填写 due_at。
@@ -102,3 +132,9 @@ class OpenAIPlanner:
                 cleaned = cleaned[4:]
             cleaned = cleaned.strip()
         return cleaned
+
+    def _parse_planned_conversation(self, raw_json: str) -> PlannedConversation:
+        validator = getattr(PlannedConversation, "model_validate_json", None)
+        if callable(validator):
+            return validator(raw_json)
+        return PlannedConversation.parse_raw(raw_json)

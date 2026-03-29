@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import pytest
+import asyncio
 
 from ticktick_telegram_assistant.domain.schemas import ConversationContext
 from ticktick_telegram_assistant.integrations.openai_planner import OpenAIPlanner
@@ -29,11 +29,16 @@ class FakeOpenAIClient:
         self.responses = FakeResponsesAPI(output_text, error=error)
 
 
-@pytest.mark.asyncio
-async def test_plan_returns_structured_actions_from_json_response() -> None:
+def test_plan_returns_structured_actions_from_json_response() -> None:
     client = FakeOpenAIClient(
         """
         {
+          "intent_type": "task_write",
+          "task_write": {
+            "write_type": "create",
+            "target_title": "给导师发邮件",
+            "summary": "明天下午3点提醒我给导师发邮件"
+          },
           "actions": [
             {
               "action_type": "create_task",
@@ -57,14 +62,20 @@ async def test_plan_returns_structured_actions_from_json_response() -> None:
     )
     planner = OpenAIPlanner(client=client)
 
-    planned = await planner.plan(
-        ConversationContext(
-            user_text="明天下午3点提醒我给导师发邮件",
-            current_timezone="America/Los_Angeles",
-            current_local_time="2026-03-27T09:00:00-07:00",
+    planned = asyncio.run(
+        planner.plan(
+            ConversationContext(
+                user_text="明天下午3点提醒我给导师发邮件",
+                current_timezone="America/Los_Angeles",
+                current_local_time="2026-03-27T09:00:00-07:00",
+            )
         )
     )
 
+    assert planned.intent_type == "task_write"
+    assert planned.task_write is not None
+    assert planned.task_write.write_type == "create"
+    assert planned.task_write.target_title == "给导师发邮件"
     assert planned.actions[0].action_type == "create_task"
     assert planned.actions[0].payload["title"] == "给导师发邮件"
     assert planned.actions[0].payload["repeat_rule"] == "FREQ=WEEKLY;BYDAY=MO"
@@ -77,6 +88,11 @@ async def test_plan_returns_structured_actions_from_json_response() -> None:
     assert "JSON" in prompt
     assert "明天下午3点提醒我给导师发邮件" in prompt
     assert "2026-03-27T09:00:00-07:00" in prompt
+    assert "intent_type" in prompt
+    assert "query" in prompt
+    assert "reminder_control" in prompt
+    assert "clarification" in prompt
+    assert "task_write" in prompt
     assert "complete_task" in prompt
     assert "update_task" in prompt
     assert "end_at" in prompt
@@ -87,15 +103,128 @@ async def test_plan_returns_structured_actions_from_json_response() -> None:
     assert "checklist" in prompt
 
 
-@pytest.mark.asyncio
-async def test_plan_returns_empty_plan_when_model_output_is_invalid() -> None:
+def test_plan_parses_query_today_brief_intent() -> None:
+    planner = OpenAIPlanner(
+        client=FakeOpenAIClient(
+            """
+            {
+              "intent_type": "query",
+              "query": {
+                "query_kind": "today_brief",
+                "query_text": "今天有什么安排",
+                "time_scope": "today"
+              },
+              "actions": [],
+              "requires_confirmation": false,
+              "assistant_reply": "今天我先帮你看安排。"
+            }
+            """
+        )
+    )
+
+    planned = asyncio.run(
+        planner.plan(
+            ConversationContext(
+                user_text="今天有什么安排",
+                current_timezone="America/Los_Angeles",
+                current_local_time="2026-03-27T09:00:00-07:00",
+            )
+        )
+    )
+
+    assert planned.intent_type == "query"
+    assert planned.query is not None
+    assert planned.query.query_kind == "today_brief"
+    assert planned.query.query_text == "今天有什么安排"
+    assert planned.query.time_scope == "today"
+    assert planned.actions == []
+    assert planned.assistant_reply == "今天我先帮你看安排。"
+
+
+def test_plan_parses_clarification_intent() -> None:
+    planner = OpenAIPlanner(
+        client=FakeOpenAIClient(
+            """
+            {
+              "intent_type": "clarification",
+              "clarification": {
+                "question": "你是想先别催，还是延后 1 小时再提醒？",
+                "options": ["先别催", "延后 1 小时"]
+              },
+              "requires_confirmation": true,
+              "assistant_reply": "你想怎么处理这条提醒？"
+            }
+            """
+        )
+    )
+
+    planned = asyncio.run(
+        planner.plan(
+            ConversationContext(
+                user_text="先别催我",
+                current_timezone="America/Los_Angeles",
+                current_local_time="2026-03-27T09:00:00-07:00",
+            )
+        )
+    )
+
+    assert planned.intent_type == "clarification"
+    assert planned.clarification is not None
+    assert planned.clarification.question == "你是想先别催，还是延后 1 小时再提醒？"
+    assert planned.clarification.options == ["先别催", "延后 1 小时"]
+    assert planned.requires_confirmation is True
+    assert planned.actions == []
+    assert planned.assistant_reply == "你想怎么处理这条提醒？"
+
+
+def test_plan_parses_reminder_control_intent() -> None:
+    planner = OpenAIPlanner(
+        client=FakeOpenAIClient(
+            """
+            {
+              "intent_type": "reminder_control",
+              "reminder_control": {
+                "control_type": "snooze",
+                "delay_minutes": 60,
+                "scope": "telegram_reminder"
+              },
+              "actions": [],
+              "requires_confirmation": false,
+              "assistant_reply": "我先帮你把提醒往后挪 1 小时。"
+            }
+            """
+        )
+    )
+
+    planned = asyncio.run(
+        planner.plan(
+            ConversationContext(
+                user_text="1小时后再提醒我",
+                current_timezone="America/Los_Angeles",
+                current_local_time="2026-03-27T09:00:00-07:00",
+            )
+        )
+    )
+
+    assert planned.intent_type == "reminder_control"
+    assert planned.reminder_control is not None
+    assert planned.reminder_control.control_type == "snooze"
+    assert planned.reminder_control.delay_minutes == 60
+    assert planned.reminder_control.scope == "telegram_reminder"
+    assert planned.actions == []
+    assert planned.assistant_reply == "我先帮你把提醒往后挪 1 小时。"
+
+
+def test_plan_returns_empty_plan_when_model_output_is_invalid() -> None:
     planner = OpenAIPlanner(client=FakeOpenAIClient("not json"))
 
-    planned = await planner.plan(
-        ConversationContext(
-            user_text="随便说一句",
-            current_timezone="America/Los_Angeles",
-            current_local_time="2026-03-27T09:00:00-07:00",
+    planned = asyncio.run(
+        planner.plan(
+            ConversationContext(
+                user_text="随便说一句",
+                current_timezone="America/Los_Angeles",
+                current_local_time="2026-03-27T09:00:00-07:00",
+            )
         )
     )
 
@@ -103,15 +232,16 @@ async def test_plan_returns_empty_plan_when_model_output_is_invalid() -> None:
     assert planned.assistant_reply is None
 
 
-@pytest.mark.asyncio
-async def test_plan_returns_empty_plan_when_openai_client_raises() -> None:
+def test_plan_returns_empty_plan_when_openai_client_raises() -> None:
     planner = OpenAIPlanner(client=FakeOpenAIClient("", error=RuntimeError("boom")))
 
-    planned = await planner.plan(
-        ConversationContext(
-            user_text="随便说一句",
-            current_timezone="America/Los_Angeles",
-            current_local_time="2026-03-27T09:00:00-07:00",
+    planned = asyncio.run(
+        planner.plan(
+            ConversationContext(
+                user_text="随便说一句",
+                current_timezone="America/Los_Angeles",
+                current_local_time="2026-03-27T09:00:00-07:00",
+            )
         )
     )
 

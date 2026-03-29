@@ -531,7 +531,9 @@ class ConversationService:
                     )
                 ]
 
+        existing_batch_context = self._load_pending_batch_context(telegram_user_id=telegram_user_id)
         reply_texts: list[str] = []
+        pending_batch_entries: list[dict] = list(existing_batch_context.get("entries") or []) if existing_batch_context else []
         for line in lines:
             line_update = update.model_copy(
                 deep=True,
@@ -548,6 +550,35 @@ class ConversationService:
                 skip_multiline_batch=True,
             )
             reply_texts.extend(reply.text for reply in line_replies if reply.text)
+            confirmation_context = self._load_pending_confirmation_context(telegram_user_id=telegram_user_id)
+            if confirmation_context is not None:
+                pending_batch_entries.append(
+                    {
+                        "context_type": "pending_confirmation",
+                        "line_text": line,
+                        "payload": confirmation_context,
+                    }
+                )
+                self._clear_pending_confirmation(telegram_user_id=telegram_user_id)
+            query_context = self._load_pending_query_context(telegram_user_id=telegram_user_id)
+            if query_context is not None:
+                pending_batch_entries.append(
+                    {
+                        "context_type": "pending_query",
+                        "line_text": line,
+                        "payload": query_context,
+                    }
+                )
+                self._clear_pending_query(telegram_user_id=telegram_user_id)
+
+        if pending_batch_entries:
+            self._save_pending_batch(
+                telegram_user_id=telegram_user_id,
+                payload={
+                    "kind": "multiline_batch_pending",
+                    "entries": pending_batch_entries,
+                },
+            )
 
         combined_text = "\n".join(reply_texts)
         return [TelegramReply(chat_id=update.message.chat.id, text=combined_text)]
@@ -879,7 +910,41 @@ class ConversationService:
             return None
         context = self._load_pending_confirmation_context(telegram_user_id=telegram_user_id)
         if context is None:
-            return None
+            batch_context = self._load_pending_batch_context(telegram_user_id=telegram_user_id)
+            if batch_context is None:
+                return None
+
+            text = update.message.text.strip()
+            if any(token in text for token in ("取消", "算了", "不用了", "不要了")):
+                self._clear_pending_batch(telegram_user_id=telegram_user_id)
+                return TelegramReply(chat_id=update.message.chat.id, text="好，我先不动这些待确认项。")
+
+            batch_entries = batch_context.get("entries") or []
+            selected_index = self._extract_candidate_index(text=text, candidate_count=len(batch_entries))
+            if selected_index is None:
+                return TelegramReply(
+                    chat_id=update.message.chat.id,
+                    text="我先停在这一步。你可以直接回我“第1条继续”“第二条继续”，或者回“取消”。",
+                )
+
+            selected_entry = batch_entries[selected_index]
+            remaining_entries = batch_entries[:selected_index] + batch_entries[selected_index + 1 :]
+            if remaining_entries:
+                self._save_pending_batch(
+                    telegram_user_id=telegram_user_id,
+                    payload={
+                        "kind": "multiline_batch_pending",
+                        "entries": remaining_entries,
+                    },
+                )
+            else:
+                self._clear_pending_batch(telegram_user_id=telegram_user_id)
+            return await self._resume_pending_batch_entry(
+                telegram_user_id=telegram_user_id,
+                chat_id=update.message.chat.id,
+                text=self._strip_pending_batch_selection_text(text) or "继续",
+                entry=selected_entry,
+            )
 
         text = update.message.text.strip()
         lower_text = text.casefold()
@@ -965,6 +1030,63 @@ class ConversationService:
         return TelegramReply(
             chat_id=update.message.chat.id,
             text="我先停在这一步。你可以回我“合并”“继续新建”“改时间”或者“取消”。",
+        )
+
+    async def _resume_pending_batch_entry(
+        self,
+        *,
+        telegram_user_id: str,
+        chat_id: int,
+        text: str,
+        entry: dict,
+    ) -> TelegramReply:
+        context_type = entry.get("context_type")
+        payload = entry.get("payload") or {}
+        if context_type == "pending_confirmation":
+            self._save_pending_confirmation(
+                telegram_user_id=telegram_user_id,
+                payload=payload,
+            )
+            response = await self._maybe_handle_pending_confirmation(
+                TelegramUpdate(
+                    update_id=0,
+                    message=TelegramMessage(
+                        message_id=0,
+                        chat=TelegramChat(id=chat_id, type="private"),
+                        text=text,
+                    ),
+                )
+            )
+            if response is not None:
+                return response
+            return TelegramReply(
+                chat_id=chat_id,
+                text="这条我先接住了，但还没法自动继续。你可以把这条单独再发我一次。",
+            )
+        if context_type == "pending_query":
+            self._save_pending_query(
+                telegram_user_id=telegram_user_id,
+                payload=payload,
+            )
+            response = await self._maybe_handle_pending_query(
+                TelegramUpdate(
+                    update_id=0,
+                    message=TelegramMessage(
+                        message_id=0,
+                        chat=TelegramChat(id=chat_id, type="private"),
+                        text=text or "对",
+                    ),
+                )
+            )
+            if response is not None:
+                return response
+            return TelegramReply(
+                chat_id=chat_id,
+                text="这条我先记住了，但还没准备好自动继续。你可以直接把你的补充发给我。",
+            )
+        return TelegramReply(
+            chat_id=chat_id,
+            text="这条待确认内容我没法继续了，你可以重新发一次。",
         )
 
     async def _execute_planner_confirmation(
@@ -1345,6 +1467,18 @@ class ConversationService:
             payload_json=payload,
         )
 
+    def _save_pending_batch(self, *, telegram_user_id: str, payload: dict) -> None:
+        if self._memory_service is None:
+            return
+        user = self._get_user_by_telegram_user_id(telegram_user_id)
+        if user is None:
+            return
+        self._memory_service.replace_active_context(
+            user_id=user.id,
+            context_type="pending_batch",
+            payload_json=payload,
+        )
+
     def _load_pending_confirmation_context(self, *, telegram_user_id: str) -> dict | None:
         if self._memory_service is None:
             return None
@@ -1361,6 +1495,27 @@ class ConversationService:
         if user is None:
             return
         self._memory_service.clear_active_context(user_id=user.id, context_type="pending_confirmation")
+
+    def _load_pending_batch_context(self, *, telegram_user_id: str) -> dict | None:
+        if self._memory_service is None:
+            return None
+        user = self._get_user_by_telegram_user_id(telegram_user_id)
+        if user is None:
+            return None
+        context = self._memory_service.get_active_context(user_id=user.id, context_type="pending_batch")
+        return None if context is None else dict(context.payload_json or {})
+
+    def _clear_pending_batch(self, *, telegram_user_id: str) -> None:
+        if self._memory_service is None:
+            return
+        user = self._get_user_by_telegram_user_id(telegram_user_id)
+        if user is None:
+            return
+        self._memory_service.clear_active_context(user_id=user.id, context_type="pending_batch")
+
+    def _strip_pending_batch_selection_text(self, text: str) -> str:
+        stripped = re.sub(r"^\s*第\s*[0-9一二三四五六七八九十]+\s*(?:条|个)?\s*", "", text)
+        return stripped.strip()
 
     def _maybe_save_pending_query(self, *, telegram_user_id: str | None, reply_text: str) -> None:
         if telegram_user_id is None:

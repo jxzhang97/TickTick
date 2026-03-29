@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -30,9 +30,44 @@ class ConversationContext(BaseModel):
 
 
 class PlannedConversation(BaseModel):
+    intent_type: Optional[Literal["query", "reminder_control", "clarification", "task_write"]] = None
+    query: Optional["PlannedQueryIntent"] = None
+    reminder_control: Optional["PlannedReminderControlIntent"] = None
+    clarification: Optional["PlannedClarificationIntent"] = None
+    task_write: Optional["PlannedTaskWriteIntent"] = None
     actions: list["PlannedAction"] = Field(default_factory=list)
     requires_confirmation: bool = False
     assistant_reply: Optional[str] = None
+
+
+class PlannedQueryIntent(BaseModel):
+    query_kind: str
+    query_text: Optional[str] = None
+    time_scope: Optional[str] = None
+    target_task_id: Optional[str] = None
+    target_title: Optional[str] = None
+
+
+class PlannedReminderControlIntent(BaseModel):
+    control_type: str
+    delay_minutes: Optional[int] = None
+    scheduled_at: Optional[datetime] = None
+    target_task_id: Optional[str] = None
+    target_title: Optional[str] = None
+    scope: Optional[str] = None
+
+
+class PlannedClarificationIntent(BaseModel):
+    question: str
+    options: list[str] = Field(default_factory=list)
+    reason: Optional[str] = None
+
+
+class PlannedTaskWriteIntent(BaseModel):
+    write_type: Literal["create", "update", "complete"]
+    target_title: Optional[str] = None
+    target_task_id: Optional[str] = None
+    summary: Optional[str] = None
 
 
 class PlannedAction(BaseModel):
@@ -69,3 +104,15 @@ class TelegramReply(BaseModel):
 class TickTickOAuthConnectionResult(BaseModel):
     connected: bool
     message: str
+
+
+try:  # pydantic v2
+    PlannedConversation.model_rebuild()
+except AttributeError:  # pydantic v1
+    PlannedConversation.update_forward_refs(
+        PlannedAction=PlannedAction,
+        PlannedQueryIntent=PlannedQueryIntent,
+        PlannedReminderControlIntent=PlannedReminderControlIntent,
+        PlannedClarificationIntent=PlannedClarificationIntent,
+        PlannedTaskWriteIntent=PlannedTaskWriteIntent,
+    )
