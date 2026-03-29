@@ -153,3 +153,108 @@ async def test_build_today_brief_renders_upcoming_items_even_without_today_deadl
 
     assert "今天最重要的几件" in message
     assert "三天后开会" in message
+
+
+@pytest.mark.asyncio
+async def test_build_today_brief_excludes_future_span_tasks_from_deadline_section() -> None:
+    from ticktick_telegram_assistant.services.today_brief_service import TodayBriefService
+
+    class MixedFutureClient(FakeTickTickClient):
+        async def list_tasks(self, *, access_token: str, since=None) -> list[TickTickTask]:
+            self.calls.append({"method": "list_tasks", "access_token": access_token, "since": since})
+            return [
+                TickTickTask(
+                    id="span-1",
+                    projectId="p1",
+                    title="周二下午评审会",
+                    startDate="2026-03-31T14:00:00-0700",
+                    dueDate="2026-03-31T15:30:00-0700",
+                    status=0,
+                ),
+                TickTickTask(
+                    id="ddl-1",
+                    projectId="p1",
+                    title="周三前交报告",
+                    dueDate="2026-04-01T18:00:00-0700",
+                    status=0,
+                ),
+            ]
+
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        session.add(
+            User(
+                telegram_user_id="99",
+                display_name="Jiaxin",
+                current_timezone="America/Los_Angeles",
+                ticktick_access_token="access-token",
+            )
+        )
+        session.commit()
+
+    service = TodayBriefService(
+        session_factory=session_factory,
+        ticktick_client=MixedFutureClient(),
+    )
+
+    message = await service.build_today_brief(
+        telegram_user_id="99",
+        now=datetime.fromisoformat("2026-03-29T09:00:00-07:00"),
+    )
+
+    ddl_section = message.split("未来 7 天的 ddl：", 1)[1].split("这几天要推进的时间窗口任务：", 1)[0]
+    assert "周三前交报告" in ddl_section
+    assert "周二下午评审会" not in ddl_section
+
+
+@pytest.mark.asyncio
+async def test_build_today_brief_uses_top_section_without_repeating_all_today_items() -> None:
+    from ticktick_telegram_assistant.services.today_brief_service import TodayBriefService
+
+    class TodayOnlyClient(FakeTickTickClient):
+        async def list_tasks(self, *, access_token: str, since=None) -> list[TickTickTask]:
+            self.calls.append({"method": "list_tasks", "access_token": access_token, "since": since})
+            return [
+                TickTickTask(
+                    id="t1",
+                    projectId="p1",
+                    title="上午先发邮件",
+                    dueDate="2026-03-29T17:00:00-0700",
+                    priority=5,
+                    status=0,
+                ),
+                TickTickTask(
+                    id="t2",
+                    projectId="p1",
+                    title="下午交周报",
+                    dueDate="2026-03-29T19:00:00-0700",
+                    status=0,
+                ),
+            ]
+
+    session_factory = make_session_factory()
+    with session_factory() as session:
+        session.add(
+            User(
+                telegram_user_id="99",
+                display_name="Jiaxin",
+                current_timezone="America/Los_Angeles",
+                ticktick_access_token="access-token",
+            )
+        )
+        session.commit()
+
+    service = TodayBriefService(
+        session_factory=session_factory,
+        ticktick_client=TodayOnlyClient(),
+    )
+
+    message = await service.build_today_brief(
+        telegram_user_id="99",
+        now=datetime.fromisoformat("2026-03-29T09:00:00-07:00"),
+    )
+
+    top_section = message.split("今天最重要的几件：", 1)[1].split("今天有明确时间的安排：", 1)[0]
+    scheduled_section = message.split("今天有明确时间的安排：", 1)[1].split("未来 7 天的 ddl：", 1)[0]
+    assert top_section.index("上午先发邮件") < top_section.index("下午交周报")
+    assert "重点都在上面了" in scheduled_section

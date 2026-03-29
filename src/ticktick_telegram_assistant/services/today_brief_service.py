@@ -44,24 +44,36 @@ class TodayBriefService:
         today = current_time.date()
         scheduled_items = [item for item in task_lines if item["date"] == today.isoformat()]
         scheduled_items.sort(key=lambda item: item["sort_key"])
-        ddl_items = [
-            item
-            for item in task_lines
-            if today < item["date_obj"] <= today + timedelta(days=7)
-        ]
-        ddl_items.sort(key=lambda item: item["sort_key"])
-
+        for item in scheduled_items:
+            item["category"] = "scheduled"
         windowed_items = self._build_windowed_items(user=user, current_time=current_time, timezone_name=timezone_name)
-        top_items = scheduled_items[:3] if scheduled_items else ddl_items[:3]
+        ddl_items = self._build_deadline_items(task_lines=task_lines, today=today)
+        top_items = self._select_top_items(
+            scheduled_items=scheduled_items,
+            ddl_items=ddl_items,
+            windowed_items=windowed_items,
+        )
+        top_ids = {item.get("task_id") for item in top_items if item.get("task_id")}
+        scheduled_detail_items = self._build_detail_section(
+            items=scheduled_items,
+            excluded_ids=top_ids,
+            fallback_note="重点都在上面了。",
+        )
+        ddl_detail_items = ddl_items
+        windowed_detail_items = self._build_detail_section(
+            items=windowed_items,
+            excluded_ids=top_ids,
+            fallback_note="重点都在上面了。",
+        )
 
         if not (top_items or scheduled_items or ddl_items or windowed_items):
             return "今天在 TickTick 里我还没看到明确落在今天的安排，你可以放心一点。"
 
         return self._briefing_service.render_morning_brief(
             top_items=top_items,
-            scheduled_items=scheduled_items[:8],
-            ddl_items=ddl_items[:8],
-            windowed_items=windowed_items,
+            scheduled_items=scheduled_detail_items,
+            ddl_items=ddl_detail_items,
+            windowed_items=windowed_detail_items,
         )
 
     def _get_user(self, *, telegram_user_id: str) -> User | None:
@@ -86,6 +98,7 @@ class TodayBriefService:
         else:
             when = effective_dt.strftime("%H:%M")
         return {
+            "task_id": task.id,
             "date": effective_dt.date().isoformat(),
             "date_obj": effective_dt.date(),
             "sort_key": effective_dt,
@@ -93,6 +106,9 @@ class TodayBriefService:
             "when": when,
             "title": task.title,
             "description": description,
+            "priority": task.priority or 0,
+            "is_time_span": bool(start_dt is not None and due_dt is not None and due_dt > start_dt),
+            "category": "future",
         }
 
     def _build_windowed_items(self, *, user: User, current_time: datetime, timezone_name: str) -> list[dict]:
@@ -107,6 +123,7 @@ class TodayBriefService:
                     continue
                 items.append(
                     {
+                        "task_id": shadow.ticktick_task_id,
                         "date": shadow.window_end.date().isoformat(),
                         "date_obj": shadow.window_end.date(),
                         "sort_key": shadow.window_end,
@@ -114,10 +131,56 @@ class TodayBriefService:
                         "when": shadow.raw_nl_time or "时间窗口",
                         "title": shadow.normalized_title or "待推进事项",
                         "description": None,
+                        "priority": 0,
+                        "is_time_span": False,
+                        "category": "windowed",
                     }
                 )
         items.sort(key=lambda item: item["sort_key"])
         return items[:8]
+
+    def _build_deadline_items(self, *, task_lines: list[dict], today) -> list[dict]:
+        items = [
+            item
+            for item in task_lines
+            if today < item["date_obj"] <= today + timedelta(days=7) and not item.get("is_time_span")
+        ]
+        items.sort(key=lambda item: item["sort_key"])
+        for item in items:
+            item["category"] = "ddl"
+        return items
+
+    def _select_top_items(
+        self,
+        *,
+        scheduled_items: list[dict],
+        ddl_items: list[dict],
+        windowed_items: list[dict],
+    ) -> list[dict]:
+        candidates = [
+            *scheduled_items,
+            *ddl_items,
+            *windowed_items,
+        ]
+        ranked = sorted(candidates, key=self._top_sort_key)
+        return ranked[:5]
+
+    def _top_sort_key(self, item: dict) -> tuple[int, int, datetime]:
+        category_rank = {
+            "scheduled": 0,
+            "ddl": 1,
+            "windowed": 2,
+        }.get(item.get("category"), 3)
+        priority = -(item.get("priority") or 0)
+        return (category_rank, priority, item["sort_key"])
+
+    def _build_detail_section(self, *, items: list[dict], excluded_ids: set[str], fallback_note: str) -> list[dict]:
+        detail_items = [item for item in items if item.get("task_id") not in excluded_ids]
+        if detail_items:
+            return detail_items
+        if items:
+            return [{"note": fallback_note}]
+        return []
 
     def _parse_ticktick_datetime(self, raw: str | None, *, timezone_name: str) -> datetime | None:
         if not raw:
